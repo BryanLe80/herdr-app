@@ -354,12 +354,21 @@ fn anchored(anchor: &str) -> serde_json::Value {
     serde_json::json!({ "kind": "window", "mod": "probe", "key": "probe", "anchor": anchor, "width": 300, "height": 200, "at": { "x": 100, "y": 100 } })
 }
 
+/// Fills its window with one color, so its paint can be found among the quads.
+const SOLID: &str = r##"import { View, div } from "gpui-kit";
+export default class extends View {
+  render() { return div().id("root").size_full().bg("#123456"); }
+}
+"##;
+
 /// A window whose layout is the dock, and no windows yet.
 fn open_docked(cx: &mut gpui::TestAppContext) -> (gpui::Entity<super::AppWindow>, &mut gpui::VisualTestContext) {
-    let dock = crate::mods::app_dir().join("mods/dock");
-    std::fs::create_dir_all(&dock).unwrap();
-    std::fs::write(dock.join("mod.json"), r#"{ "place": "none" }"#).unwrap();
-    std::fs::write(dock.join("main.js"), DOCK).unwrap();
+    for (name, main) in [("dock", DOCK), ("solid", SOLID)] {
+        let dir = crate::mods::app_dir().join("mods").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("mod.json"), r#"{ "place": "none" }"#).unwrap();
+        std::fs::write(dir.join("main.js"), main).unwrap();
+    }
     let (view, cx) = open_window(cx, "probe", SIZE_PROBE, serde_json::json!({ "id": "root", "type": "block", "content": { "mod": "dock" } }));
     cx.simulate_resize(gpui::size(gpui::px(1000.0), gpui::px(600.0)));
     redraw(cx);
@@ -487,6 +496,62 @@ fn window_anchor_gone(cx: &mut gpui::TestAppContext) {
     wait(cx, 50);
     assert_eq!(count_w(&view, cx), 0);
     assert_eq!(listed(&view, cx), serde_json::json!([]));
+}
+
+/// The opacity the solid mod's fill is painted with now; None when it isn't painted.
+fn solid_alpha(cx: &mut gpui::VisualTestContext) -> Option<f32> {
+    let want = gpui::Hsla::from(gpui::rgb(0x123456));
+    let quads = cx.update(|window, _| window.painted_quads());
+    let fills: Vec<f32> = quads
+        .iter()
+        .filter_map(|q| q.background.as_solid())
+        .filter(|c| (c.h - want.h).abs() < 1e-3 && (c.s - want.s).abs() < 1e-3 && (c.l - want.l).abs() < 1e-3)
+        .map(|c| c.a)
+        .collect();
+    assert!(fills.len() <= 1, "{fills:?}");
+    fills.first().copied()
+}
+
+#[test]
+fn fading_windows_fade_what_their_mod_draws() {
+    in_own_process("window_fade_paints_the_mod");
+}
+
+#[gpui::test]
+fn window_fade_paints_the_mod(cx: &mut gpui::TestAppContext) {
+    if !running_alone("window_fade_paints_the_mod") {
+        return;
+    }
+    let (view, cx) = open_docked(cx);
+    let mut spec = anchored("btn");
+    spec["mod"] = serde_json::json!("solid");
+    open_w(&view, cx, spec.clone());
+    wait(cx, 200);
+    assert_eq!(solid_alpha(cx), Some(1.0));
+
+    // Its anchor gone, it fades where it stands: the mod's own paint too.
+    crate::mods::set_shared("dock.hidden".into(), serde_json::json!(true));
+    cx.run_until_parked();
+    redraw(cx);
+    close_w(&view, cx);
+    wait(cx, 75);
+    let mid = solid_alpha(cx).expect("still painted mid-fade");
+    assert!(mid > 0.0 && mid < 1.0, "mid-fade the mod is painted at {mid}");
+    wait(cx, 75);
+    assert_eq!(count_w(&view, cx), 0);
+
+    // Reduce motion: an opening fade, which ends fully opaque.
+    crate::mods::set_shared("dock.hidden".into(), serde_json::json!(false));
+    cx.run_until_parked();
+    redraw(cx);
+    cx.update(|_, cx| cx.set_reduce_motion(true));
+    open_w(&view, cx, spec);
+    wait(cx, 75);
+    let mid = solid_alpha(cx).expect("painted mid-fade");
+    assert!(mid > 0.0 && mid < 1.0, "mid-fade the mod is painted at {mid}");
+    wait(cx, 75);
+    assert_eq!(moving(cx), None);
+    assert_eq!(solid_alpha(cx), Some(1.0));
 }
 
 #[test]

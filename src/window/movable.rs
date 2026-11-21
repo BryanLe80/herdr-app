@@ -320,19 +320,49 @@ impl AppWindow {
     }
 
     /// Drops finished openings and asks for frames while a window moves.
-    pub(super) fn tick_windows(&mut self, window: &mut Window, cx: &App) {
+    pub(super) fn tick_windows(&mut self, window: &mut Window, cx: &mut App) {
         let now = cx.background_executor().now();
         let mut moving = false;
+        let mut repaint = Vec::new();
         for o in &mut self.overlays {
             let Some(m) = &o.motion else { continue };
+            repaint.push(o.id.clone());
             if m.running(now) {
                 moving = true;
             } else if o.closing.is_none() {
                 o.motion = None;
             }
         }
+        for id in repaint {
+            self.repaint_window_views(&id, cx);
+        }
         if moving {
             window.request_animation_frame();
+        }
+    }
+
+    /// Marks the cached views in a window (its mods, its terminals) dirty for
+    /// this frame. GPUI bakes opacity into what a view paints and reuses that
+    /// paint while the view's bounds and clip stay put, as they do in a fade
+    /// and on the frame a motion ends: without this the mod stays as opaque as
+    /// when it last changed.
+    fn repaint_window_views(&self, id: &str, cx: &mut App) {
+        let Some(o) = self.overlays.iter().find(|o| o.id == id) else { return };
+        let slots: Vec<String> = match &o.layout {
+            Some(l) => l.visible_blocks().iter().map(|n| n.id.clone()).collect(),
+            None => vec![o.slot.clone()],
+        };
+        let mut views = Vec::new();
+        for slot in &slots {
+            if let Some(root) = self.copies.get(slot).and_then(|c| c.root.as_ref()) {
+                views.push(root.read(cx).content().entity_id());
+            }
+            if let Some(t) = self.terms.get(slot) {
+                views.push(t.view.entity_id());
+            }
+        }
+        for view in views {
+            cx.notify(view);
         }
     }
 
