@@ -346,17 +346,22 @@ impl AppWindow {
         if on_terminal {
             return;
         }
-        // Outer, as `place` is: grabbed inside the border, a drop would shift it 1 px.
-        let Some(b) = self.overlays.iter().find(|o| o.id == id).and_then(|o| self.outer_bounds(o)) else { return };
+        let Some(b) = self.bounds.borrow().get(&format!("overlay:{id}")).copied() else { return };
         self.set_win_drag(Some(WinDrag { id: id.to_owned(), grab: at - b.origin, down: at, pointer: at, moving: false, resize: None }), cx);
         cx.notify();
     }
 
     fn window_move(&mut self, at: Point<Pixels>, pressed: bool, cx: &mut Context<Self>) {
         let Some(d) = &mut self.win_drag else { return };
-        // Released outside the app: no mouse up comes, so this one ends the drag.
+        // Released outside the app: no mouse up comes, so this one ends the
+        // drag. A resize saves its size here as a mouse up would; a move only ends.
         if !pressed {
-            self.window_release(cx);
+            if d.resize.is_some() {
+                self.window_release(cx);
+            } else {
+                self.set_win_drag(None, cx);
+                cx.notify();
+            }
             return;
         }
         d.pointer = at;
