@@ -278,7 +278,8 @@ fn fixed_window_edges(cx: &mut gpui::TestAppContext) {
     drag(cx, (398.0, 298.0), (448.0, 348.0));
     let [x, y, w, h] = drawn(&view, cx);
     assert_eq!((w, h), (300.0, 200.0));
-    assert!(x >= 150.0 && y >= 150.0, "moved: {x}, {y}");
+    // 151 while a move grabs inside the border (1 px shift), 150 once it grabs the outer corner.
+    assert!((150.0..=151.0).contains(&x) && (150.0..=151.0).contains(&y), "moved: {x}, {y}");
     assert!(stored().get("sizes").is_none(), "{}", stored());
 }
 
