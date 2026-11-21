@@ -394,7 +394,7 @@ impl AppWindow {
             o.closing = Some(task);
         }
         if self.win_drag.as_ref().is_some_and(|d| d.id == id) {
-            self.win_drag = None;
+            self.set_win_drag(None, cx);
         }
         // Its mod would keep the keyboard until the window is gone.
         if focus.contains_focused(window, cx) {
