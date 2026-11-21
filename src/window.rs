@@ -338,8 +338,9 @@ enum OverlayKind {
     Dialog,
     Popup,
     Toast,
-    /// Stays until closed, moves where it's dropped, comes to the front when
-    /// pressed (`movable.rs`). Never holds the keyboard on its own.
+    /// Stays until closed, moves where it's dropped, resizes from its edges
+    /// when `resizable`, comes to the front when pressed (`movable.rs`).
+    /// Never holds the keyboard on its own.
     Window,
 }
 
@@ -372,6 +373,8 @@ struct Overlay {
     /// A window: where its top left is (None: centered) and its name (`key`).
     place: Option<Point<Pixels>>,
     key: Option<String>,
+    /// A `resizable` window: the smallest it may be dragged to, as designed.
+    resizable: Option<Size<f32>>,
     /// The app's own screen (a `frame-` mod: What's new, the welcome): only
     /// its own close ends it, never a layout switch.
     frame: bool,
@@ -4020,10 +4023,15 @@ impl AppWindow {
         if bundled_toast {
             props["fitHeight"] = json!(fit_toast);
         }
+        let resizable = if kind == OverlayKind::Window { movable::resize_limits(&spec) } else { None };
+        // A size the person dragged to beats width/height, as a spot they
+        // dropped it on beats `at`; a side never dragged (0) follows the spec.
+        let dragged = key.as_deref().filter(|_| resizable.is_some()).and_then(movable::size_of);
+        let pick = |k: &str, d: Option<f32>| d.filter(|v| *v > 0.0).unwrap_or_else(|| num(k, 0.0));
         let size = match kind {
             OverlayKind::Toast => size(340.0, if fit_toast { 0.85 } else { num("height", 72.0) }),
             // No size: as big as its content (0 = unset).
-            OverlayKind::Window => size(num("width", 0.0), num("height", 0.0)),
+            OverlayKind::Window => size(pick("width", dragged.map(|s| s.width)), pick("height", dragged.map(|s| s.height))),
             // No height: as tall as the content, up to most of the window.
             _ => size(num("width", 420.0), num("height", 0.85)),
         };
@@ -4032,7 +4040,8 @@ impl AppWindow {
             _ => self.pointer,
         };
         let top = (spec.get("at").and_then(Value::as_str) == Some("top")).then(|| num("offset", 0.0));
-        let fit = fit_toast || (layout.is_none() && (kind == OverlayKind::Popup || (matches!(kind, OverlayKind::Dialog | OverlayKind::Window) && spec.get("height").is_none())));
+        let tall = spec.get("height").is_some() || dragged.is_some_and(|s| s.height > 0.0);
+        let fit = fit_toast || (layout.is_none() && (kind == OverlayKind::Popup || (matches!(kind, OverlayKind::Dialog | OverlayKind::Window) && !tall)));
         if kind == OverlayKind::Window && place.is_none() && spec.get("at").is_some_and(|v| v.get("x").is_some()) {
             place = Some(at);
         }
@@ -4073,6 +4082,7 @@ impl AppWindow {
             bare: spec.get("frame").and_then(Value::as_str) == Some("none"),
             place,
             key: key.clone(),
+            resizable,
             frame: spec.get("mod").and_then(Value::as_str).is_some_and(|m| m.starts_with("frame-")),
         });
         if let Some(k) = &key {
@@ -7576,6 +7586,7 @@ export default class Probe extends View {
     }
 
     include!("window/drag_tests.rs");
+    include!("window/movable_tests.rs");
 
     /// The whole path, in a real window: a layout names the toast mod, a
     /// notification opens it with its props, and it can close itself (as one

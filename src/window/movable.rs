@@ -3,6 +3,8 @@
 //! for itself drags), and the one pressed last is on top. With a `key` a
 //! window remembers its spot, and opening that key again replaces it; with
 //! `keep` it also reopens on the next start, in the layout that opened it.
+//! A `resizable` one also follows its sides and corners as they're dragged,
+//! and remembers that size under its key too.
 //! A layout switch closes them (they belong to their layout, like its mods).
 
 use super::*;
@@ -11,6 +13,14 @@ use super::*;
 const DRAG_START: f32 = 4.0;
 /// How much of a window stays on screen however far it's dragged, px.
 const KEEP_SHOWN: f32 = 48.0;
+/// How thick a resize grip is, straddling the window's side, px.
+const GRIP: f32 = 8.0;
+/// The smallest a resizable window gets without `minWidth`/`minHeight`, as designed.
+const MIN_WIDTH: f32 = KEEP_SHOWN * 2.0;
+const MIN_HEIGHT: f32 = KEEP_SHOWN;
+/// No `minWidth`/`minHeight` goes below this: up to 1 a size means a share of
+/// the window, and below it the corner grips would cover each other.
+const MIN_FLOOR: f32 = GRIP * 4.0;
 
 pub struct WinDrag {
     pub id: String,
@@ -19,6 +29,59 @@ pub struct WinDrag {
     down: Point<Pixels>,
     pointer: Point<Pixels>,
     moving: bool,
+    /// Pressed on a grip: the drag resizes the window instead of moving it.
+    resize: Option<Resize>,
+}
+
+#[derive(Clone, Copy)]
+struct Resize {
+    edge: ResizeEdge,
+    /// The window as it was at the press; every move resizes from there.
+    from: Bounds<Pixels>,
+    min: Size<Pixels>,
+    screen: Size<Pixels>,
+}
+
+/// `resizable: true` on a window's spec: the smallest it may be dragged to, as designed.
+pub fn resize_limits(spec: &Value) -> Option<Size<f32>> {
+    if spec.get("resizable").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let num = |k: &str, d: f32| spec.get(k).and_then(Value::as_f64).map_or(d, |v| v as f32).max(MIN_FLOOR);
+    Some(size(num("minWidth", MIN_WIDTH), num("minHeight", MIN_HEIGHT)))
+}
+
+/// Which sides a grip moves: left, top, right, bottom.
+fn sides(edge: ResizeEdge) -> (bool, bool, bool, bool) {
+    use ResizeEdge::*;
+    (
+        matches!(edge, Left | TopLeft | BottomLeft),
+        matches!(edge, Top | TopLeft | TopRight),
+        matches!(edge, Right | TopRight | BottomRight),
+        matches!(edge, Bottom | BottomLeft | BottomRight),
+    )
+}
+
+/// A window's bounds while `edge` is dragged from `down` to `pointer`: the
+/// other sides stay, it's never smaller than `min`, and the pointer counts only
+/// inside `screen`, so a dragged side can't leave the app.
+fn resized(from: Bounds<Pixels>, edge: ResizeEdge, down: Point<Pixels>, pointer: Point<Pixels>, min: Size<Pixels>, screen: Size<Pixels>) -> Bounds<Pixels> {
+    let (left, top, right, bottom) = sides(edge);
+    let d = point(pointer.x.max(px(0.0)).min(screen.width), pointer.y.max(px(0.0)).min(screen.height)) - down;
+    let (mut a, mut b) = (from.origin, from.bottom_right());
+    if left {
+        a.x = (a.x + d.x).min(b.x - min.width);
+    }
+    if right {
+        b.x = (b.x + d.x).max(a.x + min.width);
+    }
+    if top {
+        a.y = (a.y + d.y).min(b.y - min.height);
+    }
+    if bottom {
+        b.y = (b.y + d.y).max(a.y + min.height);
+    }
+    Bounds::from_corners(a, b)
 }
 
 // ---- windows.json: spots by key, and the kept windows of each layout
@@ -44,8 +107,22 @@ pub fn place_of(key: &str) -> Option<Point<Pixels>> {
     Some(point(px(p.first()?.as_f64()? as f32), px(p.get(1)?.as_f64()? as f32)))
 }
 
-fn remember(key: &str, at: Point<Pixels>) {
-    edit(|v| v["places"][key] = json!([f32::from(at.x).round(), f32::from(at.y).round()]));
+/// A resizable window's size as last dragged, as designed (0: by its content,
+/// up to 1: a share of the window). Files from before resizing have none.
+pub fn size_of(key: &str) -> Option<Size<f32>> {
+    let s = read().get("sizes")?.get(key)?.as_array()?.clone();
+    Some(size(s.first()?.as_f64()? as f32, s.get(1)?.as_f64()? as f32))
+}
+
+fn remember(key: &str, at: Point<Pixels>, dragged: Option<Size<f32>>) {
+    // Thousandths keep shares exact without writing f32 noise (523.4000244140625).
+    let r = |v: f32| (f64::from(v) * 1000.0).round() / 1000.0;
+    edit(|v| {
+        v["places"][key] = json!([f32::from(at.x).round(), f32::from(at.y).round()]);
+        if let Some(s) = dragged {
+            v["sizes"][key] = json!([r(s.width), r(s.height)]);
+        }
+    });
 }
 
 pub fn keep(layout: &str, key: &str, spec: &Value) {
@@ -90,7 +167,7 @@ impl AppWindow {
         let measured = self.bounds.borrow().get(&o.slot).map(|b| b.size);
         let size = measured.unwrap_or_default();
         let at = match (&self.win_drag, o.place) {
-            (Some(d), _) if d.id == o.id && d.moving => d.pointer - d.grab,
+            (Some(d), _) if d.id == o.id && d.moving && d.resize.is_none() => d.pointer - d.grab,
             (_, Some(p)) => p,
             _ => point((viewport.width - size.width) / 2.0, (viewport.height - size.height) / 2.0),
         };
@@ -124,7 +201,78 @@ impl AppWindow {
                     this.window_press(&press, ev.position, cx);
                 }),
             );
-        div().absolute().left(x).top(y).when(measured.is_none(), |d| d.opacity(0.0)).child(body).into_any_element()
+        let grips = if o.resizable.is_some() { self.window_grips(&o.id, cx) } else { Vec::new() };
+        div().absolute().left(x).top(y).when(measured.is_none(), |d| d.opacity(0.0)).child(body).children(grips).into_any_element()
+    }
+
+    /// Strips across a resizable window's sides and squares on its corners,
+    /// above its content: a press there resizes and never reaches the mod.
+    fn window_grips(&self, id: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let (g, out) = (px(GRIP), px(-GRIP / 2.0));
+        let grip = |edge: ResizeEdge, cursor: CursorStyle| {
+            let id = id.to_owned();
+            div()
+                .id(SharedString::from(format!("grip-{id}-{edge:?}")))
+                .absolute()
+                .occlude()
+                .cursor(cursor)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.raise_window(&id, cx);
+                        this.resize_press(&id, edge, ev.position, window.viewport_size(), cx);
+                    }),
+                )
+        };
+        let corner = |edge, cursor| grip(edge, cursor).w(g * 2.0).h(g * 2.0);
+        // Corners last: on top where they meet the strips.
+        vec![
+            grip(ResizeEdge::Top, CursorStyle::ResizeUpDown).top(out).left(g).right(g).h(g),
+            grip(ResizeEdge::Bottom, CursorStyle::ResizeUpDown).bottom(out).left(g).right(g).h(g),
+            grip(ResizeEdge::Left, CursorStyle::ResizeLeftRight).left(out).top(g).bottom(g).w(g),
+            grip(ResizeEdge::Right, CursorStyle::ResizeLeftRight).right(out).top(g).bottom(g).w(g),
+            corner(ResizeEdge::TopLeft, CursorStyle::ResizeUpLeftDownRight).top(out).left(out),
+            corner(ResizeEdge::TopRight, CursorStyle::ResizeUpRightDownLeft).top(out).right(out),
+            corner(ResizeEdge::BottomLeft, CursorStyle::ResizeUpRightDownLeft).bottom(out).left(out),
+            corner(ResizeEdge::BottomRight, CursorStyle::ResizeUpLeftDownRight).bottom(out).right(out),
+        ]
+        .into_iter()
+        .map(IntoElement::into_any_element)
+        .collect()
+    }
+
+    fn resize_press(&mut self, id: &str, edge: ResizeEdge, at: Point<Pixels>, screen: Size<Pixels>, cx: &mut Context<Self>) {
+        let Some(o) = self.overlays.iter().find(|o| o.id == id) else { return };
+        let Some(min) = o.resizable else { return };
+        let Some(b) = self.bounds.borrow().get(&o.slot).copied() else { return };
+        // Measured inside the border, but `size` and `place` include it.
+        let from = if o.bare { b } else { b.dilate(px(1.0)) };
+        let min = size(settings::z(min.width), settings::z(min.height));
+        let resize = Resize { edge, from, min, screen };
+        self.win_drag = Some(WinDrag { id: id.to_owned(), grab: at - from.origin, down: at, pointer: at, moving: false, resize: Some(resize) });
+        cx.notify();
+    }
+
+    fn resize_window(&mut self, id: &str, edge: ResizeEdge, b: Bounds<Pixels>, cx: &mut Context<Self>) {
+        let Some(o) = self.overlays.iter_mut().find(|o| o.id == id) else { return };
+        let (left, top, right, bottom) = sides(edge);
+        let zoom = settings::zoom();
+        o.place = Some(b.origin);
+        if left || right {
+            o.size.width = f32::from(b.size.width) / zoom;
+        }
+        if top || bottom {
+            o.size.height = f32::from(b.size.height) / zoom;
+            // A fitted mod stays as tall as its content, not the dragged height.
+            if o.fit {
+                o.fit = false;
+                if let Some(root) = self.copies.get(&o.slot).and_then(|c| c.root.clone()) {
+                    root.update(cx, |r, cx| r.set_fit_content(false, cx));
+                }
+            }
+        }
+        cx.notify();
     }
 
     fn raise_window(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -146,7 +294,7 @@ impl AppWindow {
             return;
         }
         let Some(b) = self.bounds.borrow().get(&format!("overlay:{id}")).copied() else { return };
-        self.win_drag = Some(WinDrag { id: id.to_owned(), grab: at - b.origin, down: at, pointer: at, moving: false });
+        self.win_drag = Some(WinDrag { id: id.to_owned(), grab: at - b.origin, down: at, pointer: at, moving: false, resize: None });
         cx.notify();
     }
 
@@ -158,26 +306,34 @@ impl AppWindow {
             return;
         }
         d.pointer = at;
-        let dist = f32::from((at.x - d.down.x).abs()).max(f32::from((at.y - d.down.y).abs()));
+        if let Some(r) = d.resize {
+            d.moving = true;
+            let (id, b) = (d.id.clone(), resized(r.from, r.edge, d.down, at, r.min, r.screen));
+            self.resize_window(&id, r.edge, b, cx);
+            return;
+        }
+        let dist =f32::from((at.x - d.down.x).abs()).max(f32::from((at.y - d.down.y).abs()));
         if d.moving || dist >= DRAG_START {
             d.moving = true;
             cx.notify();
         }
     }
 
-    /// Ends a press: a drag leaves the window there (and remembers it under its
-    /// key); returns true so the release doesn't also click what's under it.
+    /// Ends a press: a drag leaves the window there, at its size (and remembers
+    /// them under its key); returns true so the release doesn't also click
+    /// what's under it.
     fn window_release(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(d) = self.win_drag.take() else { return false };
         cx.notify();
         if !d.moving {
             return false;
         }
-        let at = d.pointer - d.grab;
         if let Some(o) = self.overlays.iter_mut().find(|o| o.id == d.id) {
-            o.place = Some(at);
-            if let Some(k) = &o.key {
-                remember(k, at);
+            if d.resize.is_none() {
+                o.place = Some(d.pointer - d.grab);
+            }
+            if let (Some(k), Some(at)) = (&o.key, o.place) {
+                remember(k, at, d.resize.map(|_| o.size));
             }
         }
         true
@@ -209,5 +365,55 @@ impl AppWindow {
             .size_full()
             .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MIN_FLOOR, MIN_HEIGHT, MIN_WIDTH, resize_limits, resized};
+    use gpui::{Bounds, Pixels, ResizeEdge, Size, point, px, size};
+    use serde_json::json;
+
+    fn r(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
+        Bounds::new(point(px(x), px(y)), size(px(w), px(h)))
+    }
+
+    const MIN: Size<Pixels> = Size { width: px(96.0), height: px(48.0) };
+    const SCREEN: Size<Pixels> = Size { width: px(1000.0), height: px(600.0) };
+
+    #[test]
+    fn the_bottom_right_corner_grows_the_window_in_place() {
+        let b = resized(r(100.0, 100.0, 300.0, 200.0), ResizeEdge::BottomRight, point(px(400.0), px(300.0)), point(px(460.0), px(340.0)), MIN, SCREEN);
+        assert_eq!(b, r(100.0, 100.0, 360.0, 240.0));
+    }
+
+    #[test]
+    fn the_left_side_moves_the_window_and_keeps_its_right_side() {
+        let b = resized(r(100.0, 100.0, 300.0, 200.0), ResizeEdge::Left, point(px(100.0), px(200.0)), point(px(40.0), px(250.0)), MIN, SCREEN);
+        assert_eq!(b, r(40.0, 100.0, 360.0, 200.0));
+        let b = resized(r(100.0, 100.0, 300.0, 200.0), ResizeEdge::TopLeft, point(px(100.0), px(100.0)), point(px(150.0), px(130.0)), MIN, SCREEN);
+        assert_eq!(b, r(150.0, 130.0, 250.0, 170.0));
+    }
+
+    #[test]
+    fn a_window_never_gets_smaller_than_its_minimum() {
+        let from = r(100.0, 100.0, 300.0, 200.0);
+        assert_eq!(resized(from, ResizeEdge::BottomRight, point(px(400.0), px(300.0)), point(px(0.0), px(0.0)), MIN, SCREEN), r(100.0, 100.0, 96.0, 48.0));
+        assert_eq!(resized(from, ResizeEdge::TopLeft, point(px(100.0), px(100.0)), point(px(900.0), px(500.0)), MIN, SCREEN), r(304.0, 252.0, 96.0, 48.0));
+    }
+
+    #[test]
+    fn a_dragged_side_stays_in_the_app() {
+        let from = r(100.0, 100.0, 300.0, 200.0);
+        assert_eq!(resized(from, ResizeEdge::BottomRight, point(px(400.0), px(300.0)), point(px(5000.0), px(5000.0)), MIN, SCREEN), r(100.0, 100.0, 900.0, 500.0));
+        assert_eq!(resized(from, ResizeEdge::TopLeft, point(px(100.0), px(100.0)), point(px(-500.0), px(-500.0)), MIN, SCREEN), r(0.0, 0.0, 400.0, 300.0));
+    }
+
+    #[test]
+    fn only_resizable_windows_get_limits_and_those_have_a_floor() {
+        assert_eq!(resize_limits(&json!({"kind": "window"})), None);
+        assert_eq!(resize_limits(&json!({"resizable": false, "minWidth": 200})), None);
+        assert_eq!(resize_limits(&json!({"resizable": true})), Some(size(MIN_WIDTH, MIN_HEIGHT)));
+        assert_eq!(resize_limits(&json!({"resizable": true, "minWidth": 240, "minHeight": 0.5})), Some(size(240.0, MIN_FLOOR)));
     }
 }
