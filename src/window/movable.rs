@@ -126,7 +126,7 @@ pub fn size_of(key: &str) -> Option<Size<f32>> {
 /// bigger than the app. 0 (never dragged) and shares stay as they are.
 pub fn restored_size(saved: Size<f32>, min: Size<f32>, viewport: Size<Pixels>) -> Size<f32> {
     let zoom = settings::zoom();
-    let fit = |v: f32, min: f32, full: Pixels| if v > 1.0 { v.max(min).min(f32::from(full) / zoom) } else { v };
+    let fit = |v: f32, lo: f32, full: Pixels| if v > 1.0 { v.max(lo).min(f32::from(full) / zoom) } else { v };
     size(fit(saved.width, min.width, viewport.width), fit(saved.height, min.height, viewport.height))
 }
 

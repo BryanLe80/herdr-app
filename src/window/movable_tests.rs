@@ -178,7 +178,7 @@ fn window_grips_zoomed(cx: &mut gpui::TestAppContext) {
     let spec = json!({ "kind": "window", "mod": "probe", "key": "zoomed", "resizable": true, "width": 300, "height": 200, "at": { "x": 100, "y": 100 } });
     view.update_in(cx, |this, window, cx| {
         this.write_person(|p| p.zoom = 1.5, window, cx);
-        this.open_overlay("w".into(), spec, window, cx);
+        this.open_overlay("w".into(), spec.clone(), window, cx);
     });
     redraw(cx);
     assert_eq!(drawn(&view, cx), [100.0, 100.0, 450.0, 300.0]);
@@ -191,6 +191,20 @@ fn window_grips_zoomed(cx: &mut gpui::TestAppContext) {
     drag(cx, (611.0, 461.0), (0.0, 0.0));
     assert_eq!(drawn(&view, cx), [100.0, 100.0, 144.0, 72.0]);
     assert_eq!(stored()["sizes"]["zoomed"], json!([96.0, 48.0]));
+
+    // A reopen caps a bigger saved size at the app's size in designed px:
+    // viewport / zoom, which draws back up to the viewport.
+    std::fs::write(crate::mods::app_dir().join("windows.json"), json!({
+        "places": { "zoomed": [0, 0] }, "sizes": { "zoomed": [3000, 2000] }
+    }).to_string()).unwrap();
+    view.update_in(cx, |this, window, cx| {
+        this.close_overlay("w", window, cx);
+        this.open_overlay("w".into(), spec, window, cx);
+    });
+    redraw(cx);
+    let used = view.update(cx, |this, _| this.overlays.iter().find(|o| o.id == "w").map(|o| (o.size.width, o.size.height)).unwrap());
+    assert_eq!(used, (1000.0 / 1.5, 600.0 / 1.5));
+    assert_eq!(drawn(&view, cx), [0.0, 0.0, 1000.0, 600.0]);
 }
 
 #[test]
