@@ -340,6 +340,8 @@ struct Behavior {
     /// own, so without this it announces nothing.
     accessibility_label: Option<SharedString>,
     href: Option<SharedString>,
+    /// HERDR: the name the host finds this element's bounds under (`overlay_anchor`).
+    overlay_anchor: Option<SharedString>,
     on_click: Option<CallbackId>,
     on_change: Option<CallbackId>,
     token: Option<CallbackId>,
@@ -868,7 +870,13 @@ fn materialize_node(
     components::tooltip::warn_unhonoured_tooltip(&component, &behavior);
     warn_unhonoured_input(&component, &behavior);
 
-    match component {
+    // HERDR: around any component, so a button anchors as well as a div.
+    // Boxed: this frame recurses with the tree's depth (see above).
+    let anchor = behavior
+        .overlay_anchor
+        .clone()
+        .map(|name| Box::new((name, element_id(id, behavior.key.clone()))));
+    let element = match component {
         Component::Registered(component) => materialize_registered_component(
             runtime,
             snapshot,
@@ -891,6 +899,13 @@ fn materialize_node(
             runtime, snapshot, arena, node, id, component, inherited, refinement, behavior, states,
             children, slots, slot_specs, window, cx,
         ),
+    };
+    match anchor {
+        Some(anchor) => {
+            let (name, id) = *anchor;
+            crate::overlay_anchor::record(element, name, id)
+        }
+        None => element,
     }
 }
 
@@ -3451,6 +3466,13 @@ fn apply_behavior(behavior: &mut Behavior, name: &str, args: &[Bridged]) {
         "drag_paths" => {
             behavior.drag_paths = args.first().and_then(|v| v.as_str().ok())
                 .and_then(|v| serde_json::from_str(v).ok());
+        }
+        "overlay_anchor" => {
+            behavior.overlay_anchor = args
+                .first()
+                .and_then(|value| value.as_str().ok())
+                .filter(|name| !name.is_empty())
+                .map(SharedString::from);
         }
         "href" => {
             behavior.href = args

@@ -7486,6 +7486,7 @@ impl ShellRuntime {
                 "tab_index",
                 "tab_stop",
                 "href",
+                "overlay_anchor",
                 "id",
                 "overflow_scroll",
                 "overflow_x_scroll",
@@ -8525,6 +8526,7 @@ impl ShellRuntime {
             | "tab_stop"
             | "href"
             | "drag_paths"
+            | "overlay_anchor"
             | "id"
             | "overflow_scroll"
             | "overflow_x_scroll"
@@ -8617,6 +8619,7 @@ impl ShellRuntime {
                     "loop" => "loop",
                     "href" => "href",
                     "drag_paths" => "drag_paths",
+                    "overlay_anchor" => "overlay_anchor",
                     _ => "accessibility_label",
                 };
                 if name == "id"
@@ -8741,6 +8744,17 @@ impl ShellRuntime {
                     return Err(Exception::throw_type(
                         ctx,
                         "tab_index(index) expects a whole number",
+                    ));
+                }
+                if name == "overlay_anchor"
+                    && !bridged
+                        .first()
+                        .and_then(|value| value.as_str().ok())
+                        .is_some_and(|anchor| !anchor.is_empty())
+                {
+                    return Err(Exception::throw_type(
+                        ctx,
+                        "overlay_anchor(name) expects a non-empty string",
                     ));
                 }
                 if name == "href" {

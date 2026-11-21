@@ -5,9 +5,12 @@
 //! `keep` it also reopens on the next start, in the layout that opened it.
 //! A `resizable` one also follows its sides and corners as they're dragged,
 //! and remembers that size under its key too.
+//! One with an `anchor` grows out of the element a mod drew under that name
+//! (`overlay_anchor`) and shrinks back into wherever it is when it closes.
 //! A layout switch closes them (they belong to their layout, like its mods).
 
 use super::*;
+use std::cell::Cell;
 
 /// How far the pointer moves before a press becomes a drag.
 const DRAG_START: f32 = 4.0;
@@ -21,6 +24,83 @@ const MIN_HEIGHT: f32 = KEEP_SHOWN;
 /// No `minWidth`/`minHeight` goes below this: up to 1 a size means a share of
 /// the window, and below it the corner grips would cover each other.
 const MIN_FLOOR: f32 = GRIP * 4.0;
+/// How long a window takes to grow out of its anchor or shrink back into it, ms.
+const GROW_MS: f32 = 200.0;
+/// How long a window fades where it stands: its anchor is gone, or Reduce motion is on.
+const FADE_MS: f32 = 150.0;
+
+/// A window with an anchor, growing out of it, shrinking back into it, or fading.
+pub struct Motion {
+    /// The rect it starts and ends at, in window px; None: where it stands.
+    from: Option<Bounds<Pixels>>,
+    to: Option<Bounds<Pixels>>,
+    opacity: (f32, f32),
+    ms: f32,
+    /// An opening window is measured on its first frame and moves from the next.
+    start: Cell<Option<Instant>>,
+}
+
+impl Motion {
+    /// Opening: out of the anchor's rect, or only a fade with Reduce motion.
+    pub fn open(anchor: Bounds<Pixels>, reduce: bool) -> Self {
+        let (from, ms) = if reduce { (None, FADE_MS) } else { (Some(anchor), GROW_MS) };
+        Motion { from, to: None, opacity: (0.0, 1.0), ms, start: Cell::new(None) }
+    }
+
+    fn close(from: Bounds<Pixels>, opacity: f32, anchor: Option<Bounds<Pixels>>, now: Instant) -> Self {
+        let ms = if anchor.is_some() { GROW_MS } else { FADE_MS };
+        Motion { from: Some(from), to: Some(anchor.unwrap_or(from)), opacity: (opacity, 0.0), ms, start: Cell::new(Some(now)) }
+    }
+
+    fn progress(&self, now: Instant) -> f32 {
+        self.start.get().map_or(0.0, |s| settle(now.saturating_duration_since(s).as_secs_f32() * 1000.0 / self.ms))
+    }
+
+    pub fn running(&self, now: Instant) -> bool {
+        self.start.get().is_none_or(|s| now.saturating_duration_since(s).as_secs_f32() * 1000.0 < self.ms)
+    }
+
+    /// Its rect and opacity at `now`, for a window that stands at `own`.
+    fn frame(&self, own: Bounds<Pixels>, now: Instant) -> (Bounds<Pixels>, f32) {
+        let e = self.progress(now);
+        let (a, b) = (self.from.unwrap_or(own), self.to.unwrap_or(own));
+        let mix = |a: Pixels, b: Pixels| a + (b - a) * e;
+        let rect = Bounds::new(point(mix(a.origin.x, b.origin.x), mix(a.origin.y, b.origin.y)), size(mix(a.size.width, b.size.width), mix(a.size.height, b.size.height)));
+        (rect, self.opacity.0 + (self.opacity.1 - self.opacity.0) * e)
+    }
+}
+
+/// A window on its way: its frame at `rect`, and its content at full size
+/// (`own`), pinned to the frame's top left and cut to it. GPUI can't scale
+/// what it draws, and resizing the content each frame would lay the mod out
+/// again at every size. It takes no presses or keys until it lands.
+fn moving_window(o: &Overlay, body: Stateful<Div>, own: Bounds<Pixels>, (rect, opacity): (Bounds<Pixels>, f32), border: Pixels) -> AnyElement {
+    // Its own border sits under the frame's and is cut away with the rest.
+    let body = body.absolute().left(-border).top(-border).w(own.size.width).h(own.size.height);
+    div()
+        .absolute()
+        .left(rect.origin.x)
+        .top(rect.origin.y)
+        .w(rect.size.width)
+        .h(rect.size.height)
+        .debug_selector(|| "moving-window".to_owned())
+        .opacity(opacity)
+        .when(!o.bare, |d| d.bg(c("popover")).border_1().border_color(c("border")).rounded(settings::z(8.0)).shadow_lg())
+        .overflow_hidden()
+        .capture_key_down(|_, _, cx| cx.stop_propagation())
+        .child(body)
+        .child(div().absolute().inset_0().occlude())
+        .into_any_element()
+}
+
+/// A critically damped spring (it never overshoots) whose undamped period is
+/// the whole motion, scaled to land on 1 at t = 1: unscaled it would still be
+/// 1.4% short there and finish with a jump.
+fn settle(t: f32) -> f32 {
+    let w = std::f32::consts::TAU;
+    let x = |t: f32| 1.0 - (1.0 + w * t) * (-w * t).exp();
+    x(t.clamp(0.0, 1.0)) / x(1.0)
+}
 
 pub struct WinDrag {
     pub id: String,
@@ -184,15 +264,7 @@ impl AppWindow {
     /// is known (it stays invisible until then), always partly on screen.
     pub(super) fn render_window(&self, o: &Overlay, body: Stateful<Div>, viewport: Size<Pixels>, cx: &mut Context<Self>) -> AnyElement {
         let measured = self.bounds.borrow().get(&o.slot).map(|b| b.size);
-        let size = measured.unwrap_or_default();
-        let at = match (&self.win_drag, o.place) {
-            (Some(d), _) if d.id == o.id && d.moving && d.resize.is_none() => d.pointer - d.grab,
-            (_, Some(p)) => p,
-            _ => point((viewport.width - size.width) / 2.0, (viewport.height - size.height) / 2.0),
-        };
-        let keep = px(KEEP_SHOWN);
-        let x = at.x.min(viewport.width - keep).max(keep - size.width);
-        let y = at.y.min(viewport.height - keep).max(px(0.0));
+        let Point { x, y } = self.window_spot(o, measured.unwrap_or_default(), viewport);
         let measure = {
             let (bounds, slot, known) = (self.bounds.clone(), o.slot.clone(), measured.is_some());
             canvas(
@@ -220,8 +292,86 @@ impl AppWindow {
                     this.window_press(&press, ev.position, cx);
                 }),
             );
+        if let (Some(m), Some(inner)) = (&o.motion, measured) {
+            let now = cx.background_executor().now();
+            if m.start.get().is_none() {
+                m.start.set(Some(now));
+            }
+            if m.running(now) || o.closing.is_some() {
+                let border = if o.bare { px(0.0) } else { px(1.0) };
+                let own = Bounds::new(point(x, y), size(inner.width + border * 2.0, inner.height + border * 2.0));
+                return moving_window(o, body, own, m.frame(own, now), border);
+            }
+        }
         let grips = if o.resizable.is_some() { self.window_grips(&o.id, cx) } else { Vec::new() };
         div().absolute().left(x).top(y).when(measured.is_none(), |d| d.opacity(0.0)).child(body).children(grips).into_any_element()
+    }
+
+    /// Where a window of `size` stands: where it was dropped (or is being
+    /// dragged), else centered, always partly on screen.
+    fn window_spot(&self, o: &Overlay, size: Size<Pixels>, viewport: Size<Pixels>) -> Point<Pixels> {
+        let at = match (&self.win_drag, o.place) {
+            (Some(d), _) if d.id == o.id && d.moving && d.resize.is_none() => d.pointer - d.grab,
+            (_, Some(p)) => p,
+            _ => point((viewport.width - size.width) / 2.0, (viewport.height - size.height) / 2.0),
+        };
+        let keep = px(KEEP_SHOWN);
+        point(at.x.min(viewport.width - keep).max(keep - size.width), at.y.min(viewport.height - keep).max(px(0.0)))
+    }
+
+    /// Drops finished openings and asks for frames while a window moves.
+    pub(super) fn tick_windows(&mut self, window: &mut Window, cx: &App) {
+        let now = cx.background_executor().now();
+        let mut moving = false;
+        for o in &mut self.overlays {
+            let Some(m) = &o.motion else { continue };
+            if m.running(now) {
+                moving = true;
+            } else if o.closing.is_none() {
+                o.motion = None;
+            }
+        }
+        if moving {
+            window.request_animation_frame();
+        }
+    }
+
+    /// A window with an `anchor` shrinks back into it (into where it is now),
+    /// or fades where it stands when it's gone, and then closes. False: it
+    /// closes at once (no anchor, or never shown).
+    pub(super) fn close_into_anchor(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(o) = self.overlays.iter().find(|o| o.id == id) else { return false };
+        if o.closing.is_some() {
+            return true;
+        }
+        let (Some(name), Some(inner)) = (o.anchor.as_deref(), self.bounds.borrow().get(&o.slot).map(|b| b.size)) else { return false };
+        let now = cx.background_executor().now();
+        let border = if o.bare { px(0.0) } else { px(1.0) };
+        let own = Bounds::new(self.window_spot(o, inner, window.viewport_size()), size(inner.width + border * 2.0, inner.height + border * 2.0));
+        // Closed while still growing: it turns back from where it got to.
+        let (from, opacity) = o.motion.as_ref().map_or((own, 1.0), |m| m.frame(own, now));
+        let anchor = gpui_shell::overlay_anchor(window.window_handle().window_id(), name).filter(|_| !cx.reduce_motion());
+        let motion = Motion::close(from, opacity, anchor, now);
+        let wait = Duration::from_millis(motion.ms as u64);
+        let gone = id.to_owned();
+        let task = cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = this.update_in(cx, |this, window, cx| this.remove_overlay(&gone, window, cx));
+        });
+        let focus = o.focus.clone();
+        if let Some(o) = self.overlays.iter_mut().find(|o| o.id == id) {
+            o.motion = Some(motion);
+            o.closing = Some(task);
+        }
+        if self.win_drag.as_ref().is_some_and(|d| d.id == id) {
+            self.win_drag = None;
+        }
+        // Its mod would keep the keyboard until the window is gone.
+        if focus.contains_focused(window, cx) {
+            self.restore_focus(window, cx);
+        }
+        cx.notify();
+        true
     }
 
     /// Strips across a resizable window's sides and squares on its corners,
@@ -438,9 +588,53 @@ impl AppWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::{MIN_FLOOR, MIN_HEIGHT, MIN_WIDTH, resize_limits, resized, restored_size};
+    use super::{FADE_MS, GROW_MS, MIN_FLOOR, MIN_HEIGHT, MIN_WIDTH, Motion, resize_limits, resized, restored_size, settle};
     use gpui::{Bounds, Pixels, ResizeEdge, Size, point, px, size};
     use serde_json::json;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_settle_curve_lands_exactly_and_never_overshoots() {
+        assert_eq!(settle(0.0), 0.0);
+        assert_eq!(settle(1.0), 1.0);
+        assert_eq!(settle(2.0), 1.0);
+        let steps: Vec<f32> = (0..=100).map(|i| settle(i as f32 / 100.0)).collect();
+        assert!(steps.windows(2).all(|w| w[1] >= w[0] && w[1] <= 1.0), "{steps:?}");
+        assert!(settle(0.5) > 0.5, "fast out of the anchor, slow into place");
+    }
+
+    #[test]
+    fn an_opening_window_goes_from_the_anchor_to_where_it_stands() {
+        let (anchor, own) = (r(10.0, 20.0, 40.0, 20.0), r(100.0, 100.0, 300.0, 200.0));
+        let t0 = Instant::now();
+        let m = Motion::open(anchor, false);
+        assert!(m.running(t0), "waits for its first shown frame");
+        m.start.set(Some(t0));
+        assert_eq!(m.frame(own, t0), (anchor, 0.0));
+        let (mid, opacity) = m.frame(own, t0 + Duration::from_millis(GROW_MS as u64 / 2));
+        assert!(mid.origin.x > anchor.origin.x && mid.origin.x < own.origin.x && mid.size.width > anchor.size.width && mid.size.width < own.size.width);
+        assert!(opacity > 0.0 && opacity < 1.0);
+        let end = t0 + Duration::from_millis(GROW_MS as u64);
+        assert_eq!(m.frame(own, end), (own, 1.0));
+        assert!(!m.running(end));
+    }
+
+    #[test]
+    fn reduce_motion_and_a_lost_anchor_only_fade() {
+        let (anchor, own) = (r(10.0, 20.0, 40.0, 20.0), r(100.0, 100.0, 300.0, 200.0));
+        let t0 = Instant::now();
+        let m = Motion::open(anchor, true);
+        m.start.set(Some(t0));
+        let half = t0 + Duration::from_millis(FADE_MS as u64 / 2);
+        assert_eq!(m.frame(own, half).0, own);
+        assert!(!m.running(t0 + Duration::from_millis(FADE_MS as u64)));
+        let m = Motion::close(own, 1.0, None, t0);
+        assert_eq!(m.frame(own, half).0, own);
+        assert!(m.frame(own, half).1 < 1.0);
+        let m = Motion::close(own, 0.5, Some(anchor), t0);
+        assert_eq!(m.frame(own, t0), (own, 0.5), "closed mid-open: from where it had got to");
+        assert_eq!(m.frame(own, t0 + Duration::from_millis(GROW_MS as u64)), (anchor, 0.0));
+    }
 
     fn r(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
         Bounds::new(point(px(x), px(y)), size(px(w), px(h)))

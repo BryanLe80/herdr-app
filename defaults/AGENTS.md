@@ -1149,6 +1149,10 @@ All of it is in `herdr.d.ts`. In short:
   smallest it gets, at most the app's size; a window that opens smaller than
   its min isn't forced up to it by a drag. With a `key` it reopens at the dragged size, over
   `width`/`height` (a side never dragged follows them), never bigger than the app.
+  `anchor: "name"` grows it out of the element a mod drew with
+  `.overlay_anchor("name")` (a button, a list row) and shrinks it back into
+  wherever that element is when it closes; an anchor not drawn then makes it
+  just appear, or fade where it stands. Reduce motion: a fade only.
   A window can hold a layout, terminals too: a terminal keeps its presses
   (selecting text), so give it a mod block to drag by, a title bar:
   `openOverlay({ kind: "window", key: "t7", width: 600, height: 400, layout: { type: "column", children: [{ type: "block", size: { px: 28 }, content: { mod: "my-titlebar" } }, { type: "block", content: { terminal: "t7" } }] } })`.

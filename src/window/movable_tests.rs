@@ -335,3 +335,275 @@ fn windows_json_without_sizes(cx: &mut gpui::TestAppContext) {
     let spec = json!({ "kind": "window", "mod": "probe", "key": "tiny", "resizable": true, "minWidth": 200, "width": 300, "height": 200 });
     assert_eq!(reopen(&view, cx, spec), [0.0, 0.0, 200.0, 48.0]);
 }
+
+/// Draws a 40 × 20 element named "btn" at `shared("dock.at")` until
+/// `shared("dock.hidden")`, as a desk draws the button a window opens from.
+const DOCK: &str = r#"import { View, div } from "gpui-kit";
+import { shared } from "herdr";
+export default class extends View {
+  render() {
+    const at = shared("dock.at") ?? [20, 30];
+    const root = div().id("dock").size_full().relative();
+    if (shared("dock.hidden")) return root;
+    return root.child(div().id("btn").absolute().left(at[0]).top(at[1]).w(40).h(20).overlay_anchor("btn"));
+  }
+}
+"#;
+
+fn anchored(anchor: &str) -> serde_json::Value {
+    serde_json::json!({ "kind": "window", "mod": "probe", "key": "probe", "anchor": anchor, "width": 300, "height": 200, "at": { "x": 100, "y": 100 } })
+}
+
+/// A window whose layout is the dock, and no windows yet.
+fn open_docked(cx: &mut gpui::TestAppContext) -> (gpui::Entity<super::AppWindow>, &mut gpui::VisualTestContext) {
+    let dock = crate::mods::app_dir().join("mods/dock");
+    std::fs::create_dir_all(&dock).unwrap();
+    std::fs::write(dock.join("mod.json"), r#"{ "place": "none" }"#).unwrap();
+    std::fs::write(dock.join("main.js"), DOCK).unwrap();
+    let (view, cx) = open_window(cx, "probe", SIZE_PROBE, serde_json::json!({ "id": "root", "type": "block", "content": { "mod": "dock" } }));
+    cx.simulate_resize(gpui::size(gpui::px(1000.0), gpui::px(600.0)));
+    redraw(cx);
+    (view, cx)
+}
+
+fn rounded(b: gpui::Bounds<gpui::Pixels>) -> [f32; 4] {
+    [b.origin.x, b.origin.y, b.size.width, b.size.height].map(|v| f32::from(v).round())
+}
+
+/// Where "btn" is drawn now, as the engine finds it.
+fn anchor_rect(cx: &mut gpui::VisualTestContext) -> Option<[f32; 4]> {
+    let window = cx.update(|window, _| window.window_handle().window_id());
+    gpui_shell::overlay_anchor(window, "btn").map(rounded)
+}
+
+/// The window's frame while it moves; None once it stands.
+fn moving(cx: &mut gpui::VisualTestContext) -> Option<[f32; 4]> {
+    cx.debug_bounds("moving-window").map(rounded)
+}
+
+fn wait(cx: &mut gpui::VisualTestContext, ms: u64) {
+    cx.executor().advance_clock(std::time::Duration::from_millis(ms));
+    redraw(cx);
+}
+
+fn open_w(view: &gpui::Entity<super::AppWindow>, cx: &mut gpui::VisualTestContext, spec: serde_json::Value) {
+    view.update_in(cx, |this, window, cx| this.open_overlay("w".into(), spec, window, cx));
+    redraw(cx);
+}
+
+fn close_w(view: &gpui::Entity<super::AppWindow>, cx: &mut gpui::VisualTestContext) {
+    view.update_in(cx, |this, window, cx| this.close_overlay("w", window, cx));
+    redraw(cx);
+}
+
+/// The overlays `herdr-app status` lists.
+fn listed(view: &gpui::Entity<super::AppWindow>, cx: &mut gpui::VisualTestContext) -> serde_json::Value {
+    view.update_in(cx, |this, window, cx| this.control(serde_json::json!({ "status": true }), window, cx))["overlays"].clone()
+}
+
+fn count_w(view: &gpui::Entity<super::AppWindow>, cx: &mut gpui::VisualTestContext) -> usize {
+    view.update(cx, |this, _| this.overlays.iter().filter(|o| o.id == "w").count())
+}
+
+fn between(v: [f32; 4], a: [f32; 4], b: [f32; 4]) -> bool {
+    (0..4).all(|i| v[i] > a[i].min(b[i]) && v[i] < a[i].max(b[i]))
+}
+
+fn near(v: [f32; 4], w: [f32; 4]) -> bool {
+    (0..4).all(|i| (v[i] - w[i]).abs() <= 1.0)
+}
+
+#[test]
+fn anchored_windows_grow_out_of_the_anchor_and_return_to_where_it_is_at_close() {
+    in_own_process("window_anchor_round_trip");
+}
+
+#[gpui::test]
+fn window_anchor_round_trip(cx: &mut gpui::TestAppContext) {
+    if !running_alone("window_anchor_round_trip") {
+        return;
+    }
+    let (view, cx) = open_docked(cx);
+    let btn = anchor_rect(cx).expect("the dock's anchor is drawn");
+    assert_eq!(btn[2..], [40.0, 20.0]);
+    let target = [100.0, 100.0, 300.0, 200.0];
+
+    open_w(&view, cx, anchored("btn"));
+    assert_eq!(moving(cx), Some(btn), "it starts as the anchor");
+    wait(cx, 100);
+    let mid = moving(cx).unwrap();
+    assert!(between(mid, btn, target), "{mid:?} on its way from {btn:?} to {target:?}");
+    wait(cx, 100);
+    assert_eq!(moving(cx), None, "landed");
+    assert_eq!(drawn(&view, cx), target);
+    assert!(view.update(cx, |this, _| this.overlays[0].motion.is_none()));
+
+    // The anchor moves (a list re-sorts); an idle dock keeps it findable.
+    crate::mods::set_shared("dock.at".into(), serde_json::json!([600, 400]));
+    cx.run_until_parked();
+    redraw(cx);
+    redraw(cx);
+    let moved = anchor_rect(cx).expect("still drawn");
+    assert_ne!(moved, btn);
+
+    close_w(&view, cx);
+    assert_eq!(listed(&view, cx), serde_json::json!([]), "a closing window isn't open");
+    assert_eq!(count_w(&view, cx), 1, "it's still drawn while it shrinks");
+    assert_eq!(moving(cx), Some(target), "it shrinks from where it stands");
+    wait(cx, 199);
+    let end = moving(cx).unwrap();
+    assert!(near(end, moved), "{end:?} ends at the anchor where it is now, {moved:?}, not {btn:?}");
+    wait(cx, 1);
+    assert_eq!(count_w(&view, cx), 0, "gone when it's back in the anchor");
+    assert!(!view.update(cx, |this, _| this.copies.contains_key("overlay:w")), "its mod is closed");
+}
+
+#[test]
+fn anchored_windows_fade_where_they_stand_when_the_anchor_is_gone() {
+    in_own_process("window_anchor_gone");
+}
+
+#[gpui::test]
+fn window_anchor_gone(cx: &mut gpui::TestAppContext) {
+    if !running_alone("window_anchor_gone") {
+        return;
+    }
+    let (view, cx) = open_docked(cx);
+    open_w(&view, cx, anchored("btn"));
+    wait(cx, 200);
+    let target = drawn(&view, cx);
+
+    // Unpainted, the anchor leaves the map that frame.
+    crate::mods::set_shared("dock.hidden".into(), serde_json::json!(true));
+    cx.run_until_parked();
+    redraw(cx);
+    assert_eq!(anchor_rect(cx), None);
+
+    close_w(&view, cx);
+    assert_eq!(moving(cx), Some(target));
+    wait(cx, 100);
+    assert_eq!(moving(cx), Some(target), "it fades in place, no shrinking");
+    assert_eq!(count_w(&view, cx), 1);
+    wait(cx, 50);
+    assert_eq!(count_w(&view, cx), 0);
+    assert_eq!(listed(&view, cx), serde_json::json!([]));
+}
+
+#[test]
+fn windows_without_an_anchor_open_and_close_at_once() {
+    in_own_process("window_without_anchor");
+}
+
+#[gpui::test]
+fn window_without_anchor(cx: &mut gpui::TestAppContext) {
+    use serde_json::json;
+    if !running_alone("window_without_anchor") {
+        return;
+    }
+    let (view, cx) = open_docked(cx);
+    let plain = json!({ "kind": "window", "mod": "probe", "width": 300, "height": 200, "at": { "x": 100, "y": 100 } });
+    open_w(&view, cx, plain);
+    assert_eq!(moving(cx), None);
+    assert_eq!(drawn(&view, cx), [100.0, 100.0, 300.0, 200.0]);
+    assert!(view.update(cx, |this, _| this.overlays[0].motion.is_none()));
+    view.update_in(cx, |this, window, cx| this.close_overlay("w", window, cx));
+    assert_eq!(count_w(&view, cx), 0, "closed in the same call");
+
+    // An anchor that isn't drawn when it opens: it just appears.
+    open_w(&view, cx, anchored("nowhere"));
+    assert_eq!(moving(cx), None);
+    assert_eq!(drawn(&view, cx), [100.0, 100.0, 300.0, 200.0]);
+    assert_eq!(listed(&view, cx), json!(["probe"]));
+}
+
+#[test]
+fn reopening_a_window_while_it_closes_replaces_it_at_once() {
+    in_own_process("window_reopen_mid_close");
+}
+
+#[gpui::test]
+fn window_reopen_mid_close(cx: &mut gpui::TestAppContext) {
+    if !running_alone("window_reopen_mid_close") {
+        return;
+    }
+    let (view, cx) = open_docked(cx);
+    open_w(&view, cx, anchored("btn"));
+    wait(cx, 200);
+    close_w(&view, cx);
+    wait(cx, 100);
+    assert!(moving(cx).is_some());
+
+    // Same id and key, while the old one shrinks.
+    open_w(&view, cx, anchored("btn"));
+    assert_eq!(count_w(&view, cx), 1);
+    assert!(view.update(cx, |this, _| this.overlays[0].closing.is_none()));
+    assert_eq!(listed(&view, cx), serde_json::json!(["probe"]));
+    // The old one's end would have removed it by id.
+    wait(cx, 1000);
+    assert_eq!(count_w(&view, cx), 1);
+    assert_eq!(drawn(&view, cx), [100.0, 100.0, 300.0, 200.0]);
+
+    // Under a new id, the key still replaces the closing one.
+    close_w(&view, cx);
+    view.update_in(cx, |this, window, cx| this.open_overlay("w2".into(), anchored("btn"), window, cx));
+    redraw(cx);
+    assert_eq!(view.update(cx, |this, _| this.overlays.iter().map(|o| o.id.clone()).collect::<Vec<_>>()), ["w2"]);
+}
+
+#[test]
+fn a_moving_window_takes_no_input() {
+    in_own_process("window_motion_input");
+}
+
+#[gpui::test]
+fn window_motion_input(cx: &mut gpui::TestAppContext) {
+    if !running_alone("window_motion_input") {
+        return;
+    }
+    let (view, cx) = open_docked(cx);
+    open_w(&view, cx, anchored("btn"));
+    wait(cx, 100);
+    let [x, y, w, h] = moving(cx).unwrap();
+    let (cx0, cy0) = (x + w / 2.0, y + h / 2.0);
+    cx.simulate_mouse_move(gpui::point(gpui::px(cx0), gpui::px(cy0)), None, gpui::Modifiers::default());
+    cx.simulate_mouse_down(gpui::point(gpui::px(cx0), gpui::px(cy0)), gpui::MouseButton::Left, gpui::Modifiers::default());
+    assert!(view.update(cx, |this, _| this.win_drag.is_none()), "a press on a growing window starts no drag");
+    cx.simulate_mouse_up(gpui::point(gpui::px(cx0), gpui::px(cy0)), gpui::MouseButton::Left, gpui::Modifiers::default());
+    wait(cx, 100);
+    assert_eq!(drawn(&view, cx), [100.0, 100.0, 300.0, 200.0]);
+
+    // Landed, it drags again.
+    drag(cx, (250.0, 150.0), (300.0, 200.0));
+    let landed = drawn(&view, cx);
+    assert!(landed[0] >= 150.0 && landed[1] >= 150.0, "moved: {landed:?}");
+
+    // A closing one takes none either.
+    close_w(&view, cx);
+    drag(cx, (300.0, 200.0), (500.0, 300.0));
+    assert_eq!(moving(cx), Some(landed));
+}
+
+#[test]
+fn reduce_motion_fades_anchored_windows_in_place() {
+    in_own_process("window_anchor_reduce_motion");
+}
+
+#[gpui::test]
+fn window_anchor_reduce_motion(cx: &mut gpui::TestAppContext) {
+    if !running_alone("window_anchor_reduce_motion") {
+        return;
+    }
+    let (view, cx) = open_docked(cx);
+    cx.update(|_, cx| cx.set_reduce_motion(true));
+    let target = [100.0, 100.0, 300.0, 200.0];
+    open_w(&view, cx, anchored("btn"));
+    assert_eq!(moving(cx), Some(target), "no growing, only a fade");
+    wait(cx, 150);
+    assert_eq!(moving(cx), None);
+    close_w(&view, cx);
+    assert_eq!(moving(cx), Some(target));
+    wait(cx, 100);
+    assert_eq!(moving(cx), Some(target));
+    wait(cx, 50);
+    assert_eq!(count_w(&view, cx), 0);
+}

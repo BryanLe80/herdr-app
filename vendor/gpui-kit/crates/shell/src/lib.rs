@@ -81,6 +81,8 @@ pub mod host;
 pub mod host_modules;
 pub(crate) mod materialize;
 pub mod metrics;
+mod overlay_anchor;
+pub use overlay_anchor::overlay_anchor;
 pub(crate) mod path;
 pub mod plugin;
 pub mod policy;
