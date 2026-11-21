@@ -250,8 +250,39 @@ impl AppWindow {
         let from = if o.bare { b } else { b.dilate(px(1.0)) };
         let min = size(settings::z(min.width), settings::z(min.height));
         let resize = Resize { edge, from, min, screen };
-        self.win_drag = Some(WinDrag { id: id.to_owned(), grab: at - from.origin, down: at, pointer: at, moving: false, resize: Some(resize) });
+        self.set_win_drag(Some(WinDrag { id: id.to_owned(), grab: at - from.origin, down: at, pointer: at, moving: false, resize: Some(resize) }), cx);
         cx.notify();
+    }
+
+    /// Every press on a window starts and ends here, so a resize's terminals
+    /// never keep holding their rows after it. Returns the press it ends.
+    pub(super) fn set_win_drag(&mut self, drag: Option<WinDrag>, cx: &mut Context<Self>) -> Option<WinDrag> {
+        let resizing = |d: &Option<WinDrag>| d.as_ref().filter(|d| d.resize.is_some()).map(|d| d.id.clone());
+        let ended = std::mem::replace(&mut self.win_drag, drag);
+        if let Some(id) = resizing(&ended) {
+            self.hold_terminal_rows(&id, false, cx);
+        }
+        if let Some(id) = resizing(&self.win_drag) {
+            self.hold_terminal_rows(&id, true, cx);
+        }
+        ended
+    }
+
+    /// Only this window's terminals: a switch for every terminal would move
+    /// the others' text up to half a line when a resize starts and ends.
+    fn hold_terminal_rows(&self, id: &str, hold: bool, cx: &mut Context<Self>) {
+        let Some(l) = self.overlays.iter().find(|o| o.id == id).and_then(|o| o.layout.as_ref()) else { return };
+        for n in l.visible_blocks() {
+            if matches!(n.content(), Some(Content::Terminal { .. }))
+                && let Some(t) = self.pane_term(&n.id)
+            {
+                t.view.update(cx, |v, cx| {
+                    if v.hold_rows_at_top(hold) {
+                        cx.notify();
+                    }
+                });
+            }
+        }
     }
 
     fn resize_window(&mut self, id: &str, edge: ResizeEdge, b: Bounds<Pixels>, cx: &mut Context<Self>) {
@@ -294,14 +325,14 @@ impl AppWindow {
             return;
         }
         let Some(b) = self.bounds.borrow().get(&format!("overlay:{id}")).copied() else { return };
-        self.win_drag = Some(WinDrag { id: id.to_owned(), grab: at - b.origin, down: at, pointer: at, moving: false, resize: None });
+        self.set_win_drag(Some(WinDrag { id: id.to_owned(), grab: at - b.origin, down: at, pointer: at, moving: false, resize: None }), cx);
         cx.notify();
     }
 
     fn window_move(&mut self, at: Point<Pixels>, pressed: bool, cx: &mut Context<Self>) {
         let Some(d) = &mut self.win_drag else { return };
         if !pressed {
-            self.win_drag = None;
+            self.set_win_drag(None, cx);
             cx.notify();
             return;
         }
@@ -323,7 +354,7 @@ impl AppWindow {
     /// them under its key); returns true so the release doesn't also click
     /// what's under it.
     fn window_release(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(d) = self.win_drag.take() else { return false };
+        let Some(d) = self.set_win_drag(None, cx) else { return false };
         cx.notify();
         if !d.moving {
             return false;

@@ -102,6 +102,50 @@ fn window_grips_resize(cx: &mut gpui::TestAppContext) {
 }
 
 #[test]
+fn a_window_resized_from_its_edge_holds_its_terminals_rows_still() {
+    in_own_process("window_resize_holds_rows");
+}
+
+#[gpui::test]
+fn window_resize_holds_rows(cx: &mut gpui::TestAppContext) {
+    use gpui::{Modifiers, MouseButton, point, px};
+    use serde_json::json;
+    if !running_alone("window_resize_holds_rows") {
+        return;
+    }
+    let (view, cx) = open_window(cx, "probe", SIZE_PROBE, json!({ "id": "pane", "type": "block", "content": { "terminal": "t0" } }));
+    cx.simulate_resize(gpui::size(px(1000.0), px(600.0)));
+    let spec = json!({ "kind": "window", "resizable": true, "width": 300, "height": 200, "at": { "x": 100, "y": 100 },
+        "layout": { "id": "term", "type": "block", "content": { "terminal": "t1" } } });
+    view.update_in(cx, |this, window, cx| this.open_overlay("w".into(), spec.clone(), window, cx));
+    redraw(cx);
+    let held = |view: &gpui::Entity<super::AppWindow>, cx: &mut gpui::VisualTestContext| {
+        view.update(cx, |this, cx| ["ovw/term", "pane"].map(|id| this.terms[id].view.read(cx).holds_rows_at_top()))
+    };
+    assert_eq!(held(&view, cx), [false, false]);
+
+    let (from, to) = (point(px(401.0), px(301.0)), point(px(401.0), px(371.0)));
+    cx.simulate_mouse_move(from, None, Modifiers::default());
+    cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+    redraw(cx);
+    cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::default());
+    redraw(cx);
+    assert_eq!(drawn(&view, cx), [100.0, 100.0, 300.0, 270.0], "the grip resizes the window");
+    assert_eq!(held(&view, cx), [true, false], "only the resized window's terminal holds its rows");
+    cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::default());
+    redraw(cx);
+    assert_eq!(held(&view, cx), [false, false], "released: rows centre again");
+
+    // A window closed mid-resize leaves no terminal holding.
+    let t1 = view.update(cx, |this, _| this.terms["ovw/term"].view.clone());
+    cx.simulate_mouse_down(to, MouseButton::Left, Modifiers::default());
+    redraw(cx);
+    assert!(view.update(cx, |_, cx| t1.read(cx).holds_rows_at_top()));
+    view.update_in(cx, |this, window, cx| this.close_overlay("w", window, cx));
+    assert!(view.update(cx, |this, cx| this.win_drag.is_none() && !t1.read(cx).holds_rows_at_top()));
+}
+
+#[test]
 fn windows_without_resizable_move_from_their_edges() {
     in_own_process("fixed_window_edges");
 }

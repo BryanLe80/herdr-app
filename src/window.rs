@@ -4145,10 +4145,11 @@ impl AppWindow {
 
     fn remove_overlay(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(i) = self.overlays.iter().position(|o| o.id == id) {
-            let o = self.overlays.remove(i);
-            if self.win_drag.as_ref().is_some_and(|d| d.id == o.id) {
-                self.win_drag = None;
+            // While the window is still there to find its terminals.
+            if self.win_drag.as_ref().is_some_and(|d| d.id == id) {
+                self.set_win_drag(None, cx);
             }
+            let o = self.overlays.remove(i);
             self.bounds.borrow_mut().remove(&o.slot);
             self.remove_copy(&o.slot, window, cx);
             if o.layout.is_some() {
