@@ -416,9 +416,11 @@ export interface OverlaySpec {
   /** A window people resize by dragging its sides and corners (grips straddle its border, above
    *  the mod). Live: the mod keeps running and its root `on_size_change` reports each new size.
    *  With `key`, it opens at the size it was last dragged to, over width/height (as the spot it
-   *  was dropped on wins over `at`); a side never dragged follows width/height. */
+   *  was dropped on wins over `at`), never bigger than the app; a side never dragged follows
+   *  width/height. */
   resizable?: boolean;
-  /** With `resizable`: the smallest it can be dragged to, px. Default 96 × 48; at least 32. */
+  /** With `resizable`: the smallest it can be dragged to, px. Default 96 × 48; at least 32, at
+   *  most the app's size. A window that opens smaller isn't forced up to it by a drag. */
   minWidth?: number;
   minHeight?: number;
   /** With `key`: the window also reopens on the next start (and when its layout shows again),

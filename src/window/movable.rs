@@ -63,10 +63,13 @@ fn sides(edge: ResizeEdge) -> (bool, bool, bool, bool) {
 }
 
 /// A window's bounds while `edge` is dragged from `down` to `pointer`: the
-/// other sides stay, it's never smaller than `min`, and the pointer counts only
-/// inside `screen`, so a dragged side can't leave the app.
+/// other sides stay, and the pointer counts only inside `screen`, so a dragged
+/// side can't leave the app. It's never smaller than `min`, except that `min`
+/// goes no bigger than `screen` (or a side would pass the app's edge) nor than
+/// the window at the press (one opened smaller would jump off the pointer).
 fn resized(from: Bounds<Pixels>, edge: ResizeEdge, down: Point<Pixels>, pointer: Point<Pixels>, min: Size<Pixels>, screen: Size<Pixels>) -> Bounds<Pixels> {
     let (left, top, right, bottom) = sides(edge);
+    let min = size(min.width.min(screen.width).min(from.size.width), min.height.min(screen.height).min(from.size.height));
     let d = point(pointer.x.max(px(0.0)).min(screen.width), pointer.y.max(px(0.0)).min(screen.height)) - down;
     let (mut a, mut b) = (from.origin, from.bottom_right());
     if left {
@@ -102,25 +105,41 @@ fn edit(f: impl FnOnce(&mut Value)) {
     }
 }
 
+fn pair_of(map: &str, key: &str) -> Option<(f32, f32)> {
+    let v = read();
+    let p = v.get(map)?.get(key)?.as_array()?;
+    Some((p.first()?.as_f64()? as f32, p.get(1)?.as_f64()? as f32))
+}
+
 pub fn place_of(key: &str) -> Option<Point<Pixels>> {
-    let p = read().get("places")?.get(key)?.as_array()?.clone();
-    Some(point(px(p.first()?.as_f64()? as f32), px(p.get(1)?.as_f64()? as f32)))
+    pair_of("places", key).map(|(x, y)| point(px(x), px(y)))
 }
 
 /// A resizable window's size as last dragged, as designed (0: by its content,
 /// up to 1: a share of the window). Files from before resizing have none.
 pub fn size_of(key: &str) -> Option<Size<f32>> {
-    let s = read().get("sizes")?.get(key)?.as_array()?.clone();
-    Some(size(s.first()?.as_f64()? as f32, s.get(1)?.as_f64()? as f32))
+    pair_of("sizes", key).map(|(w, h)| size(w, h))
 }
 
-fn remember(key: &str, at: Point<Pixels>, dragged: Option<Size<f32>>) {
+/// A dragged size reopened where it may no longer fit (saved on a bigger
+/// display, or before `minWidth`/`minHeight` grew): at least `min`, and never
+/// bigger than the app. 0 (never dragged) and shares stay as they are.
+pub fn restored_size(saved: Size<f32>, min: Size<f32>, viewport: Size<Pixels>) -> Size<f32> {
+    let zoom = settings::zoom();
+    let fit = |v: f32, min: f32, full: Pixels| if v > 1.0 { v.max(min).min(f32::from(full) / zoom) } else { v };
+    size(fit(saved.width, min.width, viewport.width), fit(saved.height, min.height, viewport.height))
+}
+
+/// `dragged` holds the sides this drag set; a side it didn't set keeps what
+/// was saved for it (0 if never dragged), so it goes on following the spec.
+fn remember(key: &str, at: Point<Pixels>, dragged: Option<Size<Option<f32>>>) {
     // Thousandths keep shares exact without writing f32 noise (523.4000244140625).
     let r = |v: f32| (f64::from(v) * 1000.0).round() / 1000.0;
+    let (w, h) = pair_of("sizes", key).unwrap_or_default();
     edit(|v| {
         v["places"][key] = json!([f32::from(at.x).round(), f32::from(at.y).round()]);
         if let Some(s) = dragged {
-            v["sizes"][key] = json!([r(s.width), r(s.height)]);
+            v["sizes"][key] = json!([r(s.width.unwrap_or(w)), r(s.height.unwrap_or(h))]);
         }
     });
 }
@@ -245,25 +264,26 @@ impl AppWindow {
     fn resize_press(&mut self, id: &str, edge: ResizeEdge, at: Point<Pixels>, screen: Size<Pixels>, cx: &mut Context<Self>) {
         let Some(o) = self.overlays.iter().find(|o| o.id == id) else { return };
         let Some(min) = o.resizable else { return };
-        let Some(b) = self.bounds.borrow().get(&o.slot).copied() else { return };
-        // Measured inside the border, but `size` and `place` include it.
-        let from = if o.bare { b } else { b.dilate(px(1.0)) };
+        let Some(from) = self.outer_bounds(o) else { return };
         let min = size(settings::z(min.width), settings::z(min.height));
         let resize = Resize { edge, from, min, screen };
         self.set_win_drag(Some(WinDrag { id: id.to_owned(), grab: at - from.origin, down: at, pointer: at, moving: false, resize: Some(resize) }), cx);
         cx.notify();
     }
 
-    /// Every press on a window starts and ends here, so a resize's terminals
-    /// never keep holding their rows after it. Returns the press it ends.
+    /// The window border included: its bounds are measured inside the border,
+    /// but `size` and `place` include it.
+    fn outer_bounds(&self, o: &Overlay) -> Option<Bounds<Pixels>> {
+        let b = self.bounds.borrow().get(&o.slot).copied()?;
+        Some(if o.bare { b } else { b.dilate(px(1.0)) })
+    }
+
+    /// Every press on a window ends here, so a resize's terminals never keep
+    /// holding their rows after it. Returns the press it ends.
     pub(super) fn set_win_drag(&mut self, drag: Option<WinDrag>, cx: &mut Context<Self>) -> Option<WinDrag> {
-        let resizing = |d: &Option<WinDrag>| d.as_ref().filter(|d| d.resize.is_some()).map(|d| d.id.clone());
         let ended = std::mem::replace(&mut self.win_drag, drag);
-        if let Some(id) = resizing(&ended) {
-            self.hold_terminal_rows(&id, false, cx);
-        }
-        if let Some(id) = resizing(&self.win_drag) {
-            self.hold_terminal_rows(&id, true, cx);
+        if let Some(d) = ended.as_ref().filter(|d| d.resize.is_some() && d.moving) {
+            self.hold_terminal_rows(&d.id, false, cx);
         }
         ended
     }
@@ -288,6 +308,8 @@ impl AppWindow {
     fn resize_window(&mut self, id: &str, edge: ResizeEdge, b: Bounds<Pixels>, cx: &mut Context<Self>) {
         let Some(o) = self.overlays.iter_mut().find(|o| o.id == id) else { return };
         let (left, top, right, bottom) = sides(edge);
+        // The 1 px border doesn't zoom, but width/height size the window
+        // border included (border-box), so the outer size round-trips through `settings::z`.
         let zoom = settings::zoom();
         o.place = Some(b.origin);
         if left || right {
@@ -324,30 +346,36 @@ impl AppWindow {
         if on_terminal {
             return;
         }
-        let Some(b) = self.bounds.borrow().get(&format!("overlay:{id}")).copied() else { return };
+        // Outer, as `place` is: grabbed inside the border, a drop would shift it 1 px.
+        let Some(b) = self.overlays.iter().find(|o| o.id == id).and_then(|o| self.outer_bounds(o)) else { return };
         self.set_win_drag(Some(WinDrag { id: id.to_owned(), grab: at - b.origin, down: at, pointer: at, moving: false, resize: None }), cx);
         cx.notify();
     }
 
     fn window_move(&mut self, at: Point<Pixels>, pressed: bool, cx: &mut Context<Self>) {
         let Some(d) = &mut self.win_drag else { return };
+        // Released outside the app: no mouse up comes, so this one ends the drag.
         if !pressed {
-            self.set_win_drag(None, cx);
-            cx.notify();
+            self.window_release(cx);
             return;
         }
         d.pointer = at;
-        if let Some(r) = d.resize {
-            d.moving = true;
-            let (id, b) = (d.id.clone(), resized(r.from, r.edge, d.down, at, r.min, r.screen));
-            self.resize_window(&id, r.edge, b, cx);
+        let dist = f32::from((at.x - d.down.x).abs()).max(f32::from((at.y - d.down.y).abs()));
+        if !d.moving && dist < DRAG_START {
             return;
         }
-        let dist =f32::from((at.x - d.down.x).abs()).max(f32::from((at.y - d.down.y).abs()));
-        if d.moving || dist >= DRAG_START {
-            d.moving = true;
+        let started = !d.moving;
+        d.moving = true;
+        let (id, down, resize) = (d.id.clone(), d.down, d.resize);
+        let Some(r) = resize else {
             cx.notify();
+            return;
+        };
+        // From the first real move, not the press: a click on a grip must leave the terminal's text where it is.
+        if started {
+            self.hold_terminal_rows(&id, true, cx);
         }
+        self.resize_window(&id, r.edge, resized(r.from, r.edge, down, at, r.min, r.screen), cx);
     }
 
     /// Ends a press: a drag leaves the window there, at its size (and remembers
@@ -363,8 +391,12 @@ impl AppWindow {
             if d.resize.is_none() {
                 o.place = Some(d.pointer - d.grab);
             }
+            let dragged = d.resize.map(|r| {
+                let (left, top, right, bottom) = sides(r.edge);
+                size((left || right).then_some(o.size.width), (top || bottom).then_some(o.size.height))
+            });
             if let (Some(k), Some(at)) = (&o.key, o.place) {
-                remember(k, at, d.resize.map(|_| o.size));
+                remember(k, at, dragged);
             }
         }
         true
@@ -401,7 +433,7 @@ impl AppWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::{MIN_FLOOR, MIN_HEIGHT, MIN_WIDTH, resize_limits, resized};
+    use super::{MIN_FLOOR, MIN_HEIGHT, MIN_WIDTH, resize_limits, resized, restored_size};
     use gpui::{Bounds, Pixels, ResizeEdge, Size, point, px, size};
     use serde_json::json;
 
@@ -424,6 +456,43 @@ mod tests {
         assert_eq!(b, r(40.0, 100.0, 360.0, 200.0));
         let b = resized(r(100.0, 100.0, 300.0, 200.0), ResizeEdge::TopLeft, point(px(100.0), px(100.0)), point(px(150.0), px(130.0)), MIN, SCREEN);
         assert_eq!(b, r(150.0, 130.0, 250.0, 170.0));
+    }
+
+    #[test]
+    fn each_side_and_corner_moves_only_its_own_sides() {
+        let from = r(100.0, 100.0, 300.0, 200.0);
+        let drag = |edge, down: (f32, f32)| resized(from, edge, point(px(down.0), px(down.1)), point(px(down.0 + 30.0), px(down.1 + 20.0)), MIN, SCREEN);
+        assert_eq!(drag(ResizeEdge::Top, (250.0, 100.0)), r(100.0, 120.0, 300.0, 180.0));
+        assert_eq!(drag(ResizeEdge::Right, (400.0, 200.0)), r(100.0, 100.0, 330.0, 200.0));
+        assert_eq!(drag(ResizeEdge::Bottom, (250.0, 300.0)), r(100.0, 100.0, 300.0, 220.0));
+        assert_eq!(drag(ResizeEdge::TopRight, (400.0, 100.0)), r(100.0, 120.0, 330.0, 180.0));
+        assert_eq!(drag(ResizeEdge::BottomLeft, (100.0, 300.0)), r(130.0, 100.0, 270.0, 220.0));
+    }
+
+    #[test]
+    fn a_window_smaller_than_its_minimum_does_not_jump_off_the_pointer() {
+        // Opened at 60 × 30 under a 96 × 48 minimum: a 1 px move moves 1 px.
+        let from = r(10.0, 10.0, 60.0, 30.0);
+        assert_eq!(resized(from, ResizeEdge::Left, point(px(10.0), px(20.0)), point(px(11.0), px(20.0)), MIN, SCREEN), from);
+        assert_eq!(resized(from, ResizeEdge::TopLeft, point(px(10.0), px(10.0)), point(px(9.0), px(9.0)), MIN, SCREEN), r(9.0, 9.0, 61.0, 31.0));
+        assert_eq!(resized(from, ResizeEdge::BottomRight, point(px(70.0), px(40.0)), point(px(71.0), px(41.0)), MIN, SCREEN), r(10.0, 10.0, 61.0, 31.0));
+    }
+
+    #[test]
+    fn a_minimum_bigger_than_the_app_stops_at_the_app() {
+        // Wider than the app, under a minimum wider still: the left side still moves in.
+        let from = r(-100.0, 0.0, 1200.0, 200.0);
+        let huge = size(px(5000.0), px(5000.0));
+        assert_eq!(resized(from, ResizeEdge::Left, point(px(0.0), px(100.0)), point(px(100.0), px(100.0)), huge, SCREEN), r(0.0, 0.0, 1100.0, 200.0));
+        assert_eq!(resized(from, ResizeEdge::Left, point(px(0.0), px(100.0)), point(px(900.0), px(100.0)), huge, SCREEN), r(100.0, 0.0, 1000.0, 200.0));
+    }
+
+    #[test]
+    fn a_restored_size_fits_the_app_and_the_minimum() {
+        let (min, viewport) = (size(200.0, 48.0), size(px(1000.0), px(600.0)));
+        assert_eq!(restored_size(size(3000.0, 2000.0), min, viewport), size(1000.0, 600.0));
+        assert_eq!(restored_size(size(40.0, 40.0), min, viewport), size(200.0, 48.0));
+        assert_eq!(restored_size(size(0.0, 0.5), min, viewport), size(0.0, 0.5), "never dragged, and a share, stay");
     }
 
     #[test]

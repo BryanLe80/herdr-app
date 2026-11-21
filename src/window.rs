@@ -4026,7 +4026,7 @@ impl AppWindow {
         let resizable = if kind == OverlayKind::Window { movable::resize_limits(&spec) } else { None };
         // A size the person dragged to beats width/height, as a spot they
         // dropped it on beats `at`; a side never dragged (0) follows the spec.
-        let dragged = key.as_deref().filter(|_| resizable.is_some()).and_then(movable::size_of);
+        let dragged = key.as_deref().zip(resizable).and_then(|(k, min)| movable::size_of(k).map(|s| movable::restored_size(s, min, window.viewport_size())));
         let pick = |k: &str, d: Option<f32>| d.filter(|v| *v > 0.0).unwrap_or_else(|| num(k, 0.0));
         let size = match kind {
             OverlayKind::Toast => size(340.0, if fit_toast { 0.85 } else { num("height", 72.0) }),

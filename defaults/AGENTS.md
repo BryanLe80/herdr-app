@@ -1145,8 +1145,9 @@ All of it is in `herdr.d.ts`. In short:
   layout switch closes windows; kept ones come back with their layout.
   `resizable: true` lets people drag its sides and corners to resize it,
   live: the mod keeps running and its root `on_size_change` reports the new
-  size. `minWidth`/`minHeight` (px, default 96 × 48) are the smallest it
-  gets. With a `key` it reopens at the dragged size, over `width`/`height`.
+  size. `minWidth`/`minHeight` (px, default 96 × 48, at least 32) are the
+  smallest it gets. With a `key` it reopens at the dragged size, over
+  `width`/`height` (a side never dragged follows them), never bigger than the app.
   A window can hold a layout, terminals too: a terminal keeps its presses
   (selecting text), so give it a mod block to drag by, a title bar:
   `openOverlay({ kind: "window", key: "t7", width: 600, height: 400, layout: { type: "column", children: [{ type: "block", size: { px: 28 }, content: { mod: "my-titlebar" } }, { type: "block", content: { terminal: "t7" } }] } })`.
