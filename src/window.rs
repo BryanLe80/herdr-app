@@ -782,7 +782,8 @@ impl AppWindow {
                     }
                     // A stream that ended is subscribed to again, with a fresh snapshot.
                     if closed { sub = None; }
-                    let machines = if ask_machines || terminals { core.call("machine.list", json!({})).ok() } else { None };
+                    // On its clock only: an early pass for a new terminal makes no RPC of its own.
+                    let machines = if ask_machines { core.call("machine.list", json!({})).ok() } else { None };
                     let machines_changed = machines.as_ref().is_some_and(|m| m != &known_machines);
                     if let Some(m) = &machines { known_machines = m.clone(); }
                     let listed = (terminals || machines_changed).then(|| event_lines.live_for(&core.hello, &known_machines));
@@ -813,10 +814,16 @@ impl AppWindow {
                     this.fit_hidden_tabs(window, cx);
                     this.flush_documents(refresh, window, cx);
                 }).is_err() { break; }
-                let timer = cx.background_executor().timer(Duration::from_millis(500));
+                let executor = cx.background_executor().clone();
+                let timer = executor.timer(Duration::from_millis(500));
                 let channel = subscription.as_ref().map(|(channel, _)| *channel);
                 let credit = move |n| if let Some(channel) = channel { credit_core.credit(channel, n) };
-                waited = crate::hc::wait_for_events(subscription.as_ref().map(|(_, events)| events), &mut event_lines, credit, timer).await;
+                (waited, event_lines, subscription) = cx.background_executor().spawn(async move {
+                    let mut lines = event_lines;
+                    let gap = || executor.timer(crate::hc::LISTING_GAP);
+                    let waited = crate::hc::wait_for_events(subscription.as_ref().map(|(_, events)| events), &mut lines, credit, timer, gap).await;
+                    (waited, lines, subscription)
+                }).await;
             }
         }));
         w._tasks.push(cx.spawn_in(window, async move |this, cx| {
