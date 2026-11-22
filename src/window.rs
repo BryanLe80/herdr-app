@@ -721,6 +721,8 @@ impl AppWindow {
             let mut event_lines = crate::hc::EventLines::default();
             let mut known_machines = Value::Null;
             let (mut tick, mut relist) = (0u64, false);
+            let wake = crate::hc::ListWake::new();
+            let mut woken = false;
             loop {
                 let Ok((core, generation)) = this.update(cx, |this, _| {
                     (this.core.clone(), this.core_generation)
@@ -749,8 +751,12 @@ impl AppWindow {
                         this.sync(window, cx);
                     }).is_err() { break; }
                 }
-                let ask_machines = tick.is_multiple_of(5);
-                tick += 1;
+                // Only the 500 ms ticks count toward asking for machines: wakes
+                // from mods' `hc` commands may come many times a second.
+                let ask_machines = !woken && tick.is_multiple_of(5);
+                if !woken {
+                    tick += 1;
+                }
                 let relisting = std::mem::take(&mut relist);
                 let (sub, machines, refresh, listed, lines, machine_names) = cx.background_executor().spawn(async move {
                     // The local stream forwards remote doc events too.
@@ -805,7 +811,7 @@ impl AppWindow {
                     this.fit_hidden_tabs(window, cx);
                     this.flush_documents(refresh, window, cx);
                 }).is_err() { break; }
-                cx.background_executor().timer(Duration::from_millis(500)).await;
+                woken = wake.wait(cx.background_executor().timer(Duration::from_millis(500))).await;
             }
         }));
         w._tasks.push(cx.spawn_in(window, async move |this, cx| {

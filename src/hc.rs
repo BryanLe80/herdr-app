@@ -565,6 +565,51 @@ impl Drop for Core {
     }
 }
 
+/// Every window's terminal-list wake. Mods learn of a new terminal only when
+/// that loop next lists, which it otherwise does every 500 ms.
+static LIST_WAKES: Mutex<Vec<async_channel::Sender<()>>> = Mutex::new(Vec::new());
+
+/// Lists terminals again in every window now: a mod's `hc` command may have
+/// started or ended one (`hc run --bg`).
+pub fn wake_terminal_lists() {
+    let mut wakes = LIST_WAKES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Full: a wake is already pending. Closed: that window is gone.
+    wakes.retain(|tx| !matches!(tx.try_send(()), Err(async_channel::TrySendError::Closed(_))));
+}
+
+/// One window's side of `wake_terminal_lists`.
+pub struct ListWake {
+    tx: async_channel::Sender<()>,
+    rx: async_channel::Receiver<()>,
+}
+
+impl ListWake {
+    pub fn new() -> Self {
+        let (tx, rx) = async_channel::bounded(1);
+        LIST_WAKES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(tx.clone());
+        Self { tx, rx }
+    }
+
+    /// Waits for `timer` or a wake, whichever comes first; true if woken.
+    /// A wake that came while nothing waited counts at once.
+    pub async fn wait<T>(&self, timer: impl std::future::Future<Output = T>) -> bool {
+        use std::future::Future;
+        use std::task::Poll;
+        let mut timer = std::pin::pin!(timer);
+        let mut woken = std::pin::pin!(self.rx.recv());
+        std::future::poll_fn(|c| {
+            if woken.as_mut().poll(c).is_ready() {
+                Poll::Ready(true)
+            } else if timer.as_mut().poll(c).is_ready() {
+                Poll::Ready(false)
+            } else {
+                Poll::Pending
+            }
+        })
+        .await
+    }
+}
+
 /// A core that is never there, for tests that open the window: every call
 /// fails at once, and it never reports the loss (so nothing reconnects).
 #[cfg(test)]
@@ -617,6 +662,21 @@ pub fn answering() -> (Arc<Core>, mpsc::Receiver<Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_list_wait_ends_at_its_timer_or_at_a_wake() {
+        use std::future::Future;
+        let mut c = std::task::Context::from_waker(std::task::Waker::noop());
+        let wake = ListWake::new();
+        assert!(!std::pin::pin!(wake.wait(std::future::ready(()))).as_mut().poll(&mut c).is_pending(), "the timer alone ends it");
+        // Its own sender, not `wake_terminal_lists`: that would also wake other tests' waits.
+        let mut waiting = std::pin::pin!(wake.wait(std::future::pending::<()>()));
+        let _ = wake.tx.try_send(());
+        assert!(matches!(waiting.as_mut().poll(&mut c), std::task::Poll::Ready(true)), "woken before the timer");
+        // A wake while nobody waits is kept: the next wait returns at once.
+        let _ = wake.tx.try_send(());
+        assert!(matches!(std::pin::pin!(wake.wait(std::future::pending::<()>())).as_mut().poll(&mut c), std::task::Poll::Ready(true)));
+    }
 
     #[test]
     fn startup_errors_keep_the_cores_message_and_recovery_hint() {
