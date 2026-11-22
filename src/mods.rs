@@ -991,16 +991,10 @@ fn read_remote(machine: &str, path: &str) -> Result<Option<String>, String> {
 fn exec_future(command: String, args: Vec<String>, cwd: Option<String>, on: Option<String>, limit: Duration) -> impl std::future::Future<Output = Result<HostValue, HostError>> + Send {
     let (tx, rx) = async_channel::bounded(1);
     let run = move || {
-        let lists_terminals = command == "hc";
         let r = match on {
             Some(m) => run_remote_with_limit(&m, &command, &args, cwd, limit).map(|(c, o, e)| (c, String::from_utf8_lossy(&o).into_owned(), String::from_utf8_lossy(&e).into_owned())),
             None => run_blocking(&command, &args, cwd, limit),
         };
-        // Before the result reaches the mod: a terminal it just started lists
-        // in about a frame, not on the window's next 500 ms poll.
-        if lists_terminals {
-            crate::hc::wake_terminal_lists();
-        }
         let _ = tx.send_blocking(r);
     };
     #[cfg(not(test))]
@@ -1524,19 +1518,6 @@ mod tests {
         assert!(exec_future("herdr_test_missing_command_638".into(), vec![], None, None, EXEC_LIMIT).await.is_err());
         let error = exec_future("sh".into(), vec!["-c".into(), "sleep 0.15; printf late".into()], None, None, Duration::from_millis(30)).await.unwrap_err();
         assert!(error.to_string().contains("0.03 s"), "{error}");
-    }
-
-    #[test]
-    fn an_hc_command_wakes_the_terminal_lists() {
-        use std::future::Future;
-        let mut c = std::task::Context::from_waker(std::task::Waker::noop());
-        let wake = crate::hc::ListWake::new();
-        let mut waiting = std::pin::pin!(wake.wait(std::future::pending::<()>()));
-        drop(exec_future("herdr_test_missing_command_638".into(), vec![], None, None, EXEC_LIMIT));
-        assert!(waiting.as_mut().poll(&mut c).is_pending(), "other programs don't touch terminals");
-        // Wakes whether or not `hc` is installed: `hc run --bg` may have started a terminal.
-        drop(exec_future("hc".into(), vec!["--version".into()], None, None, EXEC_LIMIT));
-        assert!(waiting.as_mut().poll(&mut c).is_ready());
     }
 
     #[test]

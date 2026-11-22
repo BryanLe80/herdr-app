@@ -51,6 +51,8 @@ pub struct Pushed {
     /// A layout document changed, or events were missed: read them again.
     pub docs: bool,
     pub terminals: bool,
+    /// Which terminals exist (or whether they still run) changed, not only a detail of one.
+    pub listing: bool,
 }
 
 impl EventLines {
@@ -130,13 +132,15 @@ impl EventLines {
                     self.resynced = true;
                     pushed.docs = true;
                     pushed.terminals = true;
+                    pushed.listing = true;
                 }
                 Some("event") if p["seq"].as_u64().is_none_or(|s| s > self.seq) => {
                     self.seq = p["seq"].as_u64().unwrap_or(self.seq);
                     if p["type"] == "doc" {
                         pushed.docs = true;
-                    } else {
-                        pushed.terminals |= self.apply(p);
+                    } else if self.apply(p) {
+                        pushed.terminals = true;
+                        pushed.listing |= matches!(p["type"].as_str(), Some("created" | "restarted" | "removed" | "finished" | "lost"));
                     }
                 }
                 _ => {}
@@ -565,49 +569,65 @@ impl Drop for Core {
     }
 }
 
-/// Every window's terminal-list wake. Mods learn of a new terminal only when
-/// that loop next lists, which it otherwise does every 500 ms.
-static LIST_WAKES: Mutex<Vec<async_channel::Sender<()>>> = Mutex::new(Vec::new());
-
-/// Lists terminals again in every window now: a mod's `hc` command may have
-/// started or ended one (`hc run --bg`).
-pub fn wake_terminal_lists() {
-    let mut wakes = LIST_WAKES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    // Full: a wake is already pending. Closed: that window is gone.
-    wakes.retain(|tx| !matches!(tx.try_send(()), Err(async_channel::TrySendError::Closed(_))));
+/// What `wait_for_events` took from the stream before it returned.
+#[derive(Default)]
+pub struct Waited {
+    pub pushed: Pushed,
+    /// The stream ended (or sent something other than data): subscribe again.
+    pub closed: bool,
 }
 
-/// One window's side of `wake_terminal_lists`.
-pub struct ListWake {
-    tx: async_channel::Sender<()>,
-    rx: async_channel::Receiver<()>,
-}
-
-impl ListWake {
-    pub fn new() -> Self {
-        let (tx, rx) = async_channel::bounded(1);
-        LIST_WAKES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(tx.clone());
-        Self { tx, rx }
-    }
-
-    /// Waits for `timer` or a wake, whichever comes first; true if woken.
-    /// A wake that came while nothing waited counts at once.
-    pub async fn wait<T>(&self, timer: impl std::future::Future<Output = T>) -> bool {
-        use std::future::Future;
-        use std::task::Poll;
-        let mut timer = std::pin::pin!(timer);
-        let mut woken = std::pin::pin!(self.rx.recv());
-        std::future::poll_fn(|c| {
-            if woken.as_mut().poll(c).is_ready() {
-                Poll::Ready(true)
-            } else if timer.as_mut().poll(c).is_ready() {
-                Poll::Ready(false)
-            } else {
-                Poll::Pending
+/// Between two listing passes: waits for `timer`, but returns as soon as an
+/// event adds, ends or removes a terminal, so a terminal a mod just started
+/// (`hc run --bg`) shows in `terminals()` without waiting out the poll.
+/// Events that only update a terminal (title, status, turn) wait for the
+/// timer, as before. Every event taken is applied to `lines` and credited.
+pub async fn wait_for_events<T>(events: Option<&async_channel::Receiver<Stream>>, lines: &mut EventLines, credit: impl Fn(usize), timer: impl std::future::Future<Output = T>) -> Waited {
+    use std::future::Future;
+    use std::task::Poll;
+    let mut timer = std::pin::pin!(timer);
+    let mut waited = Waited::default();
+    let Some(events) = events else {
+        timer.await;
+        return waited;
+    };
+    loop {
+        let next = {
+            // Dropped unfinished when the timer wins: async-channel loses no item then.
+            let mut recv = std::pin::pin!(events.recv());
+            std::future::poll_fn(|c| match recv.as_mut().poll(c) {
+                Poll::Ready(r) => Poll::Ready(Some(r)),
+                Poll::Pending if timer.as_mut().poll(c).is_ready() => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            })
+            .await
+        };
+        match next {
+            None => return waited,
+            Some(Ok(Stream::Data(bytes))) => {
+                let pushed = lines.push(&bytes);
+                credit(bytes.len());
+                waited.pushed.docs |= pushed.docs;
+                waited.pushed.terminals |= pushed.terminals;
+                if pushed.listing {
+                    waited.pushed.listing = true;
+                    return waited;
+                }
             }
-        })
-        .await
+            Some(_) => {
+                waited.closed = true;
+                return waited;
+            }
+        }
     }
+}
+
+/// How often the list loop asks for machines, which send no events.
+pub const MACHINES_EVERY: Duration = Duration::from_millis(2500);
+
+/// By time, not by pass: early passes for new terminals must not delay it.
+pub fn machines_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last.is_none_or(|t| now.saturating_duration_since(t) >= MACHINES_EVERY)
 }
 
 /// A core that is never there, for tests that open the window: every call
@@ -663,19 +683,58 @@ pub fn answering() -> (Arc<Core>, mpsc::Receiver<Value>) {
 mod tests {
     use super::*;
 
+    fn event_bytes(seq: u64, kind: &str, t: &str, data: Value) -> Vec<u8> {
+        format!("{}\n", json!({"method": "event", "params": {"seq": seq, "type": kind, "terminal": t, "data": data}})).into_bytes()
+    }
+
     #[test]
-    fn a_list_wait_ends_at_its_timer_or_at_a_wake() {
+    fn a_new_terminal_ends_the_list_wait_before_its_timer() {
         use std::future::Future;
+        use std::task::Poll;
         let mut c = std::task::Context::from_waker(std::task::Waker::noop());
-        let wake = ListWake::new();
-        assert!(!std::pin::pin!(wake.wait(std::future::ready(()))).as_mut().poll(&mut c).is_pending(), "the timer alone ends it");
-        // Its own sender, not `wake_terminal_lists`: that would also wake other tests' waits.
-        let mut waiting = std::pin::pin!(wake.wait(std::future::pending::<()>()));
-        let _ = wake.tx.try_send(());
-        assert!(matches!(waiting.as_mut().poll(&mut c), std::task::Poll::Ready(true)), "woken before the timer");
-        // A wake while nobody waits is kept: the next wait returns at once.
-        let _ = wake.tx.try_send(());
-        assert!(matches!(std::pin::pin!(wake.wait(std::future::pending::<()>())).as_mut().poll(&mut c), std::task::Poll::Ready(true)));
+        let rec = |a: &str| json!({"address": a, "state": "live", "title": "", "labels": {}, "status": null});
+        let mut lines = EventLines::new(&json!({"seq": 1, "terminals": [rec("t1")]}));
+        let (tx, rx) = async_channel::unbounded();
+        let credited = std::cell::Cell::new(0);
+        let waited = {
+            let mut wait = std::pin::pin!(wait_for_events(Some(&rx), &mut lines, |n| credited.set(credited.get() + n), std::future::pending::<()>()));
+            assert!(wait.as_mut().poll(&mut c).is_pending(), "nothing yet: waits for the timer");
+            // A burst of updates to a terminal: still the timer's to end.
+            for seq in 2..20 {
+                tx.try_send(Stream::Data(event_bytes(seq, "title", "t1", json!({"title": format!("t{seq}")})))).unwrap();
+            }
+            assert!(wait.as_mut().poll(&mut c).is_pending());
+            tx.try_send(Stream::Data(event_bytes(20, "created", "t2", rec("t2")))).unwrap();
+            let Poll::Ready(waited) = wait.as_mut().poll(&mut c) else { panic!("a created terminal must end the wait") };
+            waited
+        };
+        assert!(waited.pushed.listing && waited.pushed.terminals && !waited.closed);
+        assert_eq!(lines.live()["terminals"].as_array().unwrap().len(), 2, "applied before the next pass lists");
+        assert_eq!(lines.live()["terminals"][0]["title"], "t19");
+        assert!(credited.get() > 0, "every event taken is credited back to the core");
+    }
+
+    #[test]
+    fn the_list_wait_ends_at_its_timer_and_on_a_closed_stream() {
+        use std::future::Future;
+        use std::task::Poll;
+        let mut c = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut lines = EventLines::new(&json!({"seq": 1, "terminals": []}));
+        let (tx, rx) = async_channel::unbounded::<Stream>();
+        let Poll::Ready(waited) = std::pin::pin!(wait_for_events(Some(&rx), &mut lines, |_| {}, std::future::ready(()))).as_mut().poll(&mut c) else { panic!("the timer ends it") };
+        assert!(!waited.pushed.listing && !waited.closed);
+        drop(tx);
+        let Poll::Ready(waited) = std::pin::pin!(wait_for_events(Some(&rx), &mut lines, |_| {}, std::future::pending::<()>())).as_mut().poll(&mut c) else { panic!("a closed stream ends it") };
+        assert!(waited.closed);
+    }
+
+    #[test]
+    fn machines_are_asked_by_time_however_often_the_loop_runs() {
+        let t0 = std::time::Instant::now();
+        assert!(machines_due(None, t0), "at once on the first pass");
+        // Early passes for new terminals, many in a row: none of them asks.
+        assert!((1..25).all(|i| !machines_due(Some(t0), t0 + Duration::from_millis(i * 100))));
+        assert!(machines_due(Some(t0), t0 + MACHINES_EVERY), "and the passes don't push it back");
     }
 
     #[test]
