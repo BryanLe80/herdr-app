@@ -250,15 +250,25 @@ impl AppWindow {
         self.float_drag = Some(FloatDrag { id: id.to_owned(), owner: owner.to_owned(), down: at, pointer: at, grab, moving: false, target });
     }
 
-    fn float_move(&mut self, at: Point<Pixels>, pressed: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn float_move(&mut self, at: Point<Pixels>, button: Option<MouseButton>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(d) = &mut self.float_drag else { return };
-        // Released outside the window: no mouse up comes, so this one ends the
-        // drag where it was last carried (this move's position is elsewhere).
-        if !pressed {
-            let last = d.pointer;
-            self.float_release(last, window, cx);
-            cx.notify();
-            return;
+        match button {
+            Some(MouseButton::Left) => {}
+            // Another button reported while left is held (macOS sends a right
+            // drag then): the left press is still on.
+            Some(_) => return,
+            // Released outside the window: no mouse up came, so this move ends
+            // the drag where it was last carried (its own position is elsewhere).
+            None => {
+                let (moving, last) = (d.moving, d.pointer);
+                if moving {
+                    self.float_up_swallow = self.float_release(last, window, cx);
+                } else {
+                    self.float_drag = None;
+                }
+                cx.notify();
+                return;
+            }
         }
         d.pointer = at;
         let dist = f32::from((at.x - d.down.x).abs()).max(f32::from((at.y - d.down.y).abs()));
@@ -374,7 +384,9 @@ impl AppWindow {
 
     /// While a floating block is pressed, follows the pointer anywhere in the window.
     pub(super) fn float_tracker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        self.float_drag.as_ref()?;
+        if self.float_drag.is_none() && !self.float_up_swallow {
+            return None;
+        }
         let this = cx.entity().downgrade();
         Some(
             canvas(
@@ -383,13 +395,29 @@ impl AppWindow {
                     let t = this.clone();
                     window.on_mouse_event(move |ev: &MouseMoveEvent, phase, window, cx| {
                         if phase == DispatchPhase::Capture {
-                            let _ = t.update(cx, |this, cx| this.float_move(ev.position, ev.pressed_button == Some(MouseButton::Left), window, cx));
+                            let _ = t.update(cx, |this, cx| this.float_move(ev.position, ev.pressed_button, window, cx));
+                        }
+                    });
+                    let t = this.clone();
+                    // A new press: its mouse up is a click of its own.
+                    window.on_mouse_event(move |_: &MouseDownEvent, phase, _, cx| {
+                        if phase == DispatchPhase::Capture {
+                            let _ = t.update(cx, |this, _| this.float_up_swallow = false);
                         }
                     });
                     let t = this.clone();
                     window.on_mouse_event(move |ev: &MouseUpEvent, phase, window, cx| {
                         if phase == DispatchPhase::Capture && ev.button == MouseButton::Left {
-                            let dropped = t.update(cx, |this, cx| this.float_release(ev.position, window, cx)).unwrap_or(false);
+                            let dropped = t
+                                .update(cx, |this, cx| {
+                                    let swallowed = std::mem::take(&mut this.float_up_swallow);
+                                    if swallowed {
+                                        cx.notify();
+                                    }
+                                    let released = this.float_release(ev.position, window, cx);
+                                    swallowed || released
+                                })
+                                .unwrap_or(false);
                             if dropped {
                                 cx.stop_propagation();
                             }

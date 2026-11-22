@@ -409,6 +409,9 @@ pub struct AppWindow {
     /// looked at in place of its parent. Not saved; the pane keeps its own.
     swapped: HashMap<String, String>,
     float_drag: Option<floats::FloatDrag>,
+    /// A float drag ended by a buttonless move: a mouse up that still comes
+    /// belongs to that drag and must not click what's under it.
+    float_up_swallow: bool,
     pane_drag: Option<pane_drag::PaneDrag>,
     pane_grip_hover: Option<String>,
     /// Each pane's top row the grip sits centered in: its top header, else a strip.
@@ -542,6 +545,7 @@ impl AppWindow {
             agent_focused: None,
             swapped: HashMap::new(),
             float_drag: None,
+            float_up_swallow: false,
             pane_drag: None,
             pane_grip_hover: None,
             pane_grip_rows: RefCell::default(),

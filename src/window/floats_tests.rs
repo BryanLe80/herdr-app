@@ -55,23 +55,36 @@ fn a_float_released_outside_the_window_lands_at_its_drop_target() {
 
 #[gpui::test]
 fn float_released_outside(cx: &mut gpui::TestAppContext) {
-    use gpui::{Modifiers, point, px};
+    use gpui::{Modifiers, MouseButton, point, px};
     if !running_alone("float_released_outside") {
         return;
     }
     let (view, cx) = open_float_window(cx);
     let start = float_placement(&view, cx);
     let from = float_center(&view, cx);
-    float_press_and_move(cx, from, &[(700.0, 300.0), (950.0, 550.0)]);
+    // Carried past the window's bottom right corner (1000x600).
+    float_press_and_move(cx, from, &[(700.0, 300.0), (1100.0, 650.0)]);
     let target = float_placement(&view, cx);
     assert_ne!(target, start, "the drag picked a new spot");
+    assert_eq!(target, (serde_json::json!("right"), serde_json::json!("end")));
+    // Another button reported while left is held: still carried, nothing dropped.
+    cx.simulate_mouse_move(point(px(500.0), px(300.0)), MouseButton::Right, Modifiers::default());
+    assert!(view.update(cx, |this, _| this.float_drag.is_some()));
+    assert_eq!(float_placement(&view, cx), target);
     // Released outside the window: no mouse up comes, and the next move, back
     // over the window, has no button and is somewhere else.
     cx.simulate_mouse_move(point(px(100.0), px(100.0)), None, Modifiers::default());
+    // Before any frame: the spring ends after SNAP_MS of real time.
+    assert!(view.update(cx, |this, _| this.float_anims.contains_key("float")), "springs into place");
     float_redraw(cx);
     assert!(view.update(cx, |this, _| this.float_drag.is_none()));
     assert_eq!(float_placement(&view, cx), target, "lands where the drag was last carried");
-    assert!(view.update(cx, |this, _| this.float_anims.contains_key("float")), "springs into place");
+    // A mouse up that still comes belongs to the drag, not to a click.
+    assert!(view.update(cx, |this, _| this.float_up_swallow));
+    cx.simulate_mouse_up(point(px(100.0), px(100.0)), MouseButton::Left, Modifiers::default());
+    float_redraw(cx);
+    assert!(view.update(cx, |this, _| !this.float_up_swallow));
+    assert_eq!(float_placement(&view, cx), target);
 }
 
 #[test]
@@ -93,5 +106,5 @@ fn float_press_without_drag(cx: &mut gpui::TestAppContext) {
     float_redraw(cx);
     assert!(view.update(cx, |this, _| this.float_drag.is_none()));
     assert_eq!(float_placement(&view, cx), start);
-    assert!(view.update(cx, |this, _| this.float_anims.is_empty()));
+    assert!(view.update(cx, |this, _| this.float_anims.is_empty() && !this.float_up_swallow));
 }
