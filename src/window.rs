@@ -7480,6 +7480,7 @@ export default class Probe extends View {
     }
 
     include!("window/pane_size_tests.rs");
+    include!("window/floats_tests.rs");
 
     /// What a `{"command":"tab.move","args":{"by":-1}}` key runs.
     #[test]

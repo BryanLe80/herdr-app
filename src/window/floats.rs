@@ -250,10 +250,13 @@ impl AppWindow {
         self.float_drag = Some(FloatDrag { id: id.to_owned(), owner: owner.to_owned(), down: at, pointer: at, grab, moving: false, target });
     }
 
-    fn float_move(&mut self, at: Point<Pixels>, pressed: bool, cx: &mut Context<Self>) {
+    fn float_move(&mut self, at: Point<Pixels>, pressed: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(d) = &mut self.float_drag else { return };
+        // Released outside the window: no mouse up comes, so this one ends the
+        // drag where it was last carried (this move's position is elsewhere).
         if !pressed {
-            self.float_drag = None;
+            let last = d.pointer;
+            self.float_release(last, window, cx);
             cx.notify();
             return;
         }
@@ -378,9 +381,9 @@ impl AppWindow {
                 |_, _, _| {},
                 move |_, _, window, _| {
                     let t = this.clone();
-                    window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
+                    window.on_mouse_event(move |ev: &MouseMoveEvent, phase, window, cx| {
                         if phase == DispatchPhase::Capture {
-                            let _ = t.update(cx, |this, cx| this.float_move(ev.position, ev.pressed_button == Some(MouseButton::Left), cx));
+                            let _ = t.update(cx, |this, cx| this.float_move(ev.position, ev.pressed_button == Some(MouseButton::Left), window, cx));
                         }
                     });
                     let t = this.clone();
