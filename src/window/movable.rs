@@ -11,6 +11,8 @@ use super::*;
 const DRAG_START: f32 = 4.0;
 /// How much of a window stays on screen however far it's dragged, px.
 const KEEP_SHOWN: f32 = 48.0;
+/// A framed window's border, px: drawn around the measured bounds, so `outer_bounds` adds it back.
+pub(super) const BORDER: f32 = 1.0;
 
 pub struct WinDrag {
     pub id: String,
@@ -94,9 +96,9 @@ impl AppWindow {
     /// A window at its spot: where it was dropped, else centered once its size
     /// is known (it stays invisible until then), always partly on screen.
     pub(super) fn render_window(&self, o: &Overlay, body: Stateful<Div>, viewport: Size<Pixels>, cx: &mut Context<Self>) -> AnyElement {
-        let measured = self.bounds.borrow().get(&o.slot).map(|b| b.size);
         // Outer, as `place` is: centering or clamping the inner size puts the box 1 px off.
-        let size = self.outer_bounds(o).map(|b| b.size).unwrap_or_default();
+        let outer = self.outer_bounds(o).map(|b| b.size);
+        let size = outer.unwrap_or_default();
         let at = match (&self.win_drag, o.place) {
             (Some(d), _) if d.id == o.id && d.moving => d.pointer - d.grab,
             (_, Some(p)) => p,
@@ -104,7 +106,7 @@ impl AppWindow {
         };
         let Point { x, y } = keep_shown(at, size, viewport);
         let measure = {
-            let (bounds, slot, known) = (self.bounds.clone(), o.slot.clone(), measured.is_some());
+            let (bounds, slot, known) = (self.bounds.clone(), o.slot.clone(), outer.is_some());
             canvas(
                 move |b, window, _| {
                     if !known {
@@ -130,14 +132,14 @@ impl AppWindow {
                     this.window_press(&press, ev.position, cx);
                 }),
             );
-        div().absolute().left(x).top(y).when(measured.is_none(), |d| d.opacity(0.0)).child(body).into_any_element()
+        div().absolute().left(x).top(y).when(outer.is_none(), |d| d.opacity(0.0)).child(body).into_any_element()
     }
 
     /// The window border included: its bounds are measured inside the border,
     /// but `size` and `place` include it.
     pub(super) fn outer_bounds(&self, o: &Overlay) -> Option<Bounds<Pixels>> {
         let b = self.bounds.borrow().get(&o.slot).copied()?;
-        Some(if o.bare { b } else { b.dilate(px(1.0)) })
+        Some(if o.bare { b } else { b.dilate(px(BORDER)) })
     }
 
     fn raise_window(&mut self, id: &str, cx: &mut Context<Self>) {

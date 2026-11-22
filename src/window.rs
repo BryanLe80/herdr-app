@@ -4912,7 +4912,7 @@ impl AppWindow {
                 .when(o.layout.is_none() && o.kind.modal_keys(), |d| d.key_context("Overlay"))
                 .when(sized(o.size.width), |d| d.w(w))
                 .when(sized(o.size.height), |d| if o.fit { d.max_h(h) } else { d.h(h) })
-                .when(!o.bare, |d| d.bg(c("popover")).border_1().border_color(c("border")).rounded(settings::z(8.0)).shadow_lg())
+                .when(!o.bare, |d| d.bg(c("popover")).border(px(movable::BORDER)).border_color(c("border")).rounded(settings::z(8.0)).shadow_lg())
                 .overflow_hidden()
                 .when(o.kind == OverlayKind::Toast && !fit_toast, |d| d.flex_none())
                 .when(fit_toast, |d| {
