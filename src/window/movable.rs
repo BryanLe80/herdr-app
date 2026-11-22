@@ -39,7 +39,8 @@ fn edit(f: impl FnOnce(&mut Value)) {
     }
 }
 
-/// `at` pulled back so KEEP_SHOWN px of a window of `size` stay in the viewport.
+/// `at` pulled back so KEEP_SHOWN px of a window of `size` (border included,
+/// as `at` is) stay in the viewport.
 fn keep_shown(at: Point<Pixels>, size: Size<Pixels>, viewport: Size<Pixels>) -> Point<Pixels> {
     let keep = px(KEEP_SHOWN);
     point(at.x.min(viewport.width - keep).max(keep - size.width), at.y.min(viewport.height - keep).max(px(0.0)))
@@ -94,7 +95,8 @@ impl AppWindow {
     /// is known (it stays invisible until then), always partly on screen.
     pub(super) fn render_window(&self, o: &Overlay, body: Stateful<Div>, viewport: Size<Pixels>, cx: &mut Context<Self>) -> AnyElement {
         let measured = self.bounds.borrow().get(&o.slot).map(|b| b.size);
-        let size = measured.unwrap_or_default();
+        // Outer, as `place` is: centering or clamping the inner size puts the box 1 px off.
+        let size = self.outer_bounds(o).map(|b| b.size).unwrap_or_default();
         let at = match (&self.win_drag, o.place) {
             (Some(d), _) if d.id == o.id && d.moving => d.pointer - d.grab,
             (_, Some(p)) => p,
@@ -186,9 +188,9 @@ impl AppWindow {
             return false;
         }
         let at = d.pointer - d.grab;
-        let measured = self.overlays.iter().find(|o| o.id == d.id).and_then(|o| self.bounds.borrow().get(&o.slot).map(|b| b.size));
+        let outer = self.overlays.iter().find(|o| o.id == d.id).and_then(|o| self.outer_bounds(o)).map(|b| b.size);
         // A release outside the app reports a pointer far off screen; saving that would lose the window.
-        let at = keep_shown(at, measured.unwrap_or_default(), viewport);
+        let at = keep_shown(at, outer.unwrap_or_default(), viewport);
         if let Some(o) = self.overlays.iter_mut().find(|o| o.id == d.id) {
             o.place = Some(at);
             if let Some(k) = &o.key {

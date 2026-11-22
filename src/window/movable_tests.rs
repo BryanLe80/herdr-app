@@ -146,3 +146,54 @@ fn window_press_without_drag(cx: &mut gpui::TestAppContext) {
     assert_eq!(drawn(&view, cx), [100.0, 100.0, 300.0, 200.0]);
     assert!(stored()["places"]["moved"].is_null());
 }
+
+#[test]
+fn a_centered_window_is_centered_by_its_outer_box() {
+    in_own_process("window_centered_outer");
+}
+
+#[gpui::test]
+fn window_centered_outer(cx: &mut gpui::TestAppContext) {
+    use serde_json::json;
+    if !running_alone("window_centered_outer") {
+        return;
+    }
+    // 300x200 with its border, in 1000x600: (350, 200) for the bordered and the bare one alike.
+    let (view, cx) = open_probe_window(cx, json!({ "kind": "window", "mod": "probe", "width": 300, "height": 200 }));
+    assert_eq!(drawn(&view, cx), [350.0, 200.0, 300.0, 200.0]);
+    view.update_in(cx, |this, window, cx| {
+        this.close_overlay("w", window, cx);
+        this.open_overlay("w".into(), json!({ "kind": "window", "mod": "probe", "frame": "none", "width": 300, "height": 200 }), window, cx);
+    });
+    redraw(cx);
+    assert_eq!(drawn(&view, cx), [350.0, 200.0, 300.0, 200.0]);
+}
+
+#[test]
+fn a_clamped_window_keeps_exactly_keep_shown_of_its_outer_box() {
+    in_own_process("window_clamp_outer");
+}
+
+#[gpui::test]
+fn window_clamp_outer(cx: &mut gpui::TestAppContext) {
+    use serde_json::json;
+    if !running_alone("window_clamp_outer") {
+        return;
+    }
+    // Dropped far past the top left: the grab is (100, 50) inside the window,
+    // and its right 48 px (KEEP_SHOWN), border included, stay on screen.
+    let (view, cx) = open_probe_window(cx, moved_spec());
+    press_and_move(cx, (200.0, 150.0), &[(-5000.0, -4000.0)]);
+    release(cx, (-5000.0, -4000.0));
+    assert_eq!(drawn(&view, cx), [-252.0, 0.0, 300.0, 200.0]);
+    assert_eq!(stored()["places"]["moved"], json!([-252.0, 0.0]));
+
+    // A spot saved further out (another display): drawn with the same strip shown.
+    std::fs::write(crate::mods::app_dir().join("windows.json"), json!({ "places": { "moved": [-9999, 100] } }).to_string()).unwrap();
+    view.update_in(cx, |this, window, cx| {
+        this.close_overlay("w", window, cx);
+        this.open_overlay("w".into(), moved_spec(), window, cx);
+    });
+    redraw(cx);
+    assert_eq!(drawn(&view, cx), [-252.0, 100.0, 300.0, 200.0]);
+}
