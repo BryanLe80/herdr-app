@@ -162,12 +162,18 @@ impl AppWindow {
         cx.notify();
     }
 
-    fn window_move(&mut self, at: Point<Pixels>, pressed: bool, viewport: Size<Pixels>, cx: &mut Context<Self>) {
+    fn window_move(&mut self, at: Point<Pixels>, button: Option<MouseButton>, viewport: Size<Pixels>, cx: &mut Context<Self>) {
         let Some(d) = &mut self.win_drag else { return };
-        // Released outside the app: no mouse up comes, so this one ends the drag.
-        if !pressed {
-            self.window_release(viewport, cx);
-            return;
+        match button {
+            Some(MouseButton::Left) => {}
+            // Another button reported while left is held (macOS sends a right
+            // drag then): the left press is still on.
+            Some(_) => return,
+            // Released outside the app: no mouse up came, so this one ends the drag.
+            None => {
+                self.win_up_swallow = self.window_release(viewport, cx);
+                return;
+            }
         }
         d.pointer = at;
         let dist = f32::from((at.x - d.down.x).abs()).max(f32::from((at.y - d.down.y).abs()));
@@ -200,7 +206,9 @@ impl AppWindow {
 
     /// While a window is pressed: follows the pointer anywhere in the app.
     pub(super) fn window_tracker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        self.win_drag.as_ref()?;
+        if self.win_drag.is_none() && !self.win_up_swallow {
+            return None;
+        }
         let this = cx.entity().downgrade();
         Some(
             canvas(
@@ -210,13 +218,33 @@ impl AppWindow {
                     window.on_mouse_event(move |ev: &MouseMoveEvent, phase, window, cx| {
                         if phase == DispatchPhase::Capture {
                             let viewport = window.viewport_size();
-                            let _ = t.update(cx, |this, cx| this.window_move(ev.position, ev.pressed_button == Some(MouseButton::Left), viewport, cx));
+                            let _ = t.update(cx, |this, cx| this.window_move(ev.position, ev.pressed_button, viewport, cx));
+                        }
+                    });
+                    let t = this.clone();
+                    // A new press: its mouse up is a click of its own.
+                    window.on_mouse_event(move |_: &MouseDownEvent, phase, _, cx| {
+                        if phase == DispatchPhase::Capture {
+                            let _ = t.update(cx, |this, _| this.win_up_swallow = false);
                         }
                     });
                     let t = this.clone();
                     window.on_mouse_event(move |ev: &MouseUpEvent, phase, window, cx| {
                         let viewport = window.viewport_size();
-                        if phase == DispatchPhase::Capture && ev.button == MouseButton::Left && t.update(cx, |this, cx| this.window_release(viewport, cx)).unwrap_or(false) {
+                        if phase != DispatchPhase::Capture || ev.button != MouseButton::Left {
+                            return;
+                        }
+                        let ended = t
+                            .update(cx, |this, cx| {
+                                let swallowed = std::mem::take(&mut this.win_up_swallow);
+                                if swallowed {
+                                    cx.notify();
+                                }
+                                let released = this.window_release(viewport, cx);
+                                swallowed || released
+                            })
+                            .unwrap_or(false);
+                        if ended {
                             cx.stop_propagation();
                         }
                     });

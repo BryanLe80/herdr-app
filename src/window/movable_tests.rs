@@ -146,3 +146,59 @@ fn window_press_without_drag(cx: &mut gpui::TestAppContext) {
     assert_eq!(drawn(&view, cx), [100.0, 100.0, 300.0, 200.0]);
     assert!(stored()["places"]["moved"].is_null());
 }
+
+#[test]
+fn another_held_button_keeps_the_window_drag() {
+    in_own_process("window_move_other_button");
+}
+
+#[gpui::test]
+fn window_move_other_button(cx: &mut gpui::TestAppContext) {
+    use gpui::{Modifiers, MouseButton, point, px};
+    use serde_json::json;
+    if !running_alone("window_move_other_button") {
+        return;
+    }
+    let (view, cx) = open_probe_window(cx, moved_spec());
+    press_and_move(cx, (200.0, 150.0), &[(250.0, 200.0)]);
+    // macOS reports a right drag while left is held: not a release, and not where it goes.
+    cx.simulate_mouse_move(point(px(600.0), px(400.0)), MouseButton::Right, Modifiers::default());
+    redraw(cx);
+    assert!(view.update(cx, |this, _| this.win_drag.is_some()), "still dragging");
+    assert!(stored()["places"]["moved"].is_null(), "nothing saved mid-drag");
+    release(cx, (250.0, 200.0));
+    assert_eq!(drawn(&view, cx), [150.0, 150.0, 300.0, 200.0]);
+    assert_eq!(stored()["places"]["moved"], json!([150.0, 150.0]));
+}
+
+#[test]
+fn a_late_mouse_up_after_a_buttonless_drop_clicks_nothing() {
+    in_own_process("window_move_late_mouse_up");
+}
+
+#[gpui::test]
+fn window_move_late_mouse_up(cx: &mut gpui::TestAppContext) {
+    use gpui::{Modifiers, MouseButton, point, px};
+    if !running_alone("window_move_late_mouse_up") {
+        return;
+    }
+    let (view, cx) = open_probe_window(cx, moved_spec());
+    press_and_move(cx, (200.0, 150.0), &[(250.0, 200.0)]);
+    cx.simulate_mouse_move(point(px(300.0), px(300.0)), None, Modifiers::default());
+    redraw(cx);
+    assert!(view.update(cx, |this, _| this.win_drag.is_none()));
+    assert!(view.update(cx, |this, _| this.win_up_swallow), "a mouse up still to come belongs to the drag");
+    cx.simulate_mouse_up(point(px(300.0), px(300.0)), MouseButton::Left, Modifiers::default());
+    redraw(cx);
+    assert!(view.update(cx, |this, _| !this.win_up_swallow));
+    // A new press is a click of its own: its mouse up isn't swallowed.
+    view.update(cx, |this, _| this.win_up_swallow = true);
+    redraw(cx);
+    cx.simulate_mouse_down(point(px(700.0), px(500.0)), MouseButton::Left, Modifiers::default());
+    assert!(view.update(cx, |this, _| !this.win_up_swallow));
+    // A press that never became a drag, ended by a buttonless move: nothing to swallow.
+    press_and_move(cx, (200.0, 150.0), &[(201.0, 151.0)]);
+    cx.simulate_mouse_move(point(px(400.0), px(400.0)), None, Modifiers::default());
+    redraw(cx);
+    assert!(view.update(cx, |this, _| this.win_drag.is_none() && !this.win_up_swallow));
+}
