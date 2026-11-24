@@ -16,6 +16,8 @@ use std::cell::Cell;
 const DRAG_START: f32 = 4.0;
 /// How much of a window stays on screen however far it's dragged, px.
 const KEEP_SHOWN: f32 = 48.0;
+/// A framed window's border, px: drawn around the measured bounds, so `outer_bounds` adds it back.
+pub(super) const BORDER: f32 = 1.0;
 /// How thick a resize grip is, straddling the window's side, px.
 const GRIP: f32 = 8.0;
 /// The smallest a resizable window gets without `minWidth`/`minHeight`, as designed.
@@ -85,7 +87,7 @@ fn moving_window(o: &Overlay, body: Stateful<Div>, own: Bounds<Pixels>, (rect, o
         .h(rect.size.height)
         .debug_selector(|| "moving-window".to_owned())
         .opacity(opacity)
-        .when(!o.bare, |d| d.bg(c("popover")).border_1().border_color(c("border")).rounded(settings::z(8.0)).shadow_lg())
+        .when(!o.bare, |d| d.bg(c("popover")).border(px(BORDER)).border_color(c("border")).rounded(settings::z(8.0)).shadow_lg())
         .overflow_hidden()
         .capture_key_down(|_, _, cx| cx.stop_propagation())
         .child(body)
@@ -185,7 +187,8 @@ fn edit(f: impl FnOnce(&mut Value)) {
     }
 }
 
-/// `at` pulled back so KEEP_SHOWN px of a window of `size` stay in the viewport.
+/// `at` pulled back so KEEP_SHOWN px of a window of `size` (border included,
+/// as `at` is) stay in the viewport.
 fn keep_shown(at: Point<Pixels>, size: Size<Pixels>, viewport: Size<Pixels>) -> Point<Pixels> {
     let keep = px(KEEP_SHOWN);
     point(at.x.min(viewport.width - keep).max(keep - size.width), at.y.min(viewport.height - keep).max(px(0.0)))
@@ -270,7 +273,9 @@ impl AppWindow {
     /// is known (it stays invisible until then), always partly on screen.
     pub(super) fn render_window(&self, o: &Overlay, body: Stateful<Div>, viewport: Size<Pixels>, cx: &mut Context<Self>) -> AnyElement {
         let measured = self.bounds.borrow().get(&o.slot).map(|b| b.size);
-        let Point { x, y } = self.window_spot(o, measured.unwrap_or_default(), viewport);
+        // Outer, as `place` is: centering or clamping the inner size puts the box 1 px off.
+        let outer = self.outer_bounds(o).map(|b| b.size);
+        let Point { x, y } = self.window_spot(o, outer.unwrap_or_default(), viewport);
         let measure = {
             let (bounds, slot, known) = (self.bounds.clone(), o.slot.clone(), measured.is_some());
             canvas(
@@ -304,7 +309,7 @@ impl AppWindow {
                 m.start.set(Some(now));
             }
             if m.running(now) || o.closing.is_some() {
-                let border = if o.bare { px(0.0) } else { px(1.0) };
+                let border = if o.bare { px(0.0) } else { px(BORDER) };
                 let own = Bounds::new(point(x, y), size(inner.width + border * 2.0, inner.height + border * 2.0));
                 return moving_window(o, body, own, m.frame(own, now), border);
             }
@@ -381,8 +386,9 @@ impl AppWindow {
         }
         let (Some(name), Some(inner)) = (o.anchor.as_deref(), self.bounds.borrow().get(&o.slot).map(|b| b.size)) else { return false };
         let now = cx.background_executor().now();
-        let border = if o.bare { px(0.0) } else { px(1.0) };
-        let own = Bounds::new(self.window_spot(o, inner, window.viewport_size()), size(inner.width + border * 2.0, inner.height + border * 2.0));
+        let border = if o.bare { px(0.0) } else { px(BORDER) };
+        let outer = size(inner.width + border * 2.0, inner.height + border * 2.0);
+        let own = Bounds::new(self.window_spot(o, outer, window.viewport_size()), outer);
         // Closed while still growing: it turns back from where it got to.
         let (from, opacity) = o.motion.as_ref().map_or((own, 1.0), |m| m.frame(own, now));
         let anchor = gpui_shell::overlay_anchor(window.window_handle().window_id(), name).filter(|_| !cx.reduce_motion());
@@ -510,7 +516,7 @@ impl AppWindow {
     /// but `size` and `place` include it.
     pub(super) fn outer_bounds(&self, o: &Overlay) -> Option<Bounds<Pixels>> {
         let b = self.bounds.borrow().get(&o.slot).copied()?;
-        Some(if o.bare { b } else { b.dilate(px(1.0)) })
+        Some(if o.bare { b } else { b.dilate(px(BORDER)) })
     }
 
     fn raise_window(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -579,9 +585,9 @@ impl AppWindow {
             return false;
         }
         let at = d.pointer - d.grab;
-        let measured = self.overlays.iter().find(|o| o.id == d.id).and_then(|o| self.bounds.borrow().get(&o.slot).map(|b| b.size));
+        let outer = self.overlays.iter().find(|o| o.id == d.id).and_then(|o| self.outer_bounds(o)).map(|b| b.size);
         // A release outside the app reports a pointer far off screen; saving that would lose the window.
-        let at = keep_shown(at, measured.unwrap_or_default(), viewport);
+        let at = keep_shown(at, outer.unwrap_or_default(), viewport);
         if let Some(o) = self.overlays.iter_mut().find(|o| o.id == d.id) {
             if d.resize.is_none() {
                 o.place = Some(at);
