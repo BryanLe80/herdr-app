@@ -39,6 +39,12 @@ fn edit(f: impl FnOnce(&mut Value)) {
     }
 }
 
+/// `at` pulled back so KEEP_SHOWN px of a window of `size` stay in the viewport.
+fn keep_shown(at: Point<Pixels>, size: Size<Pixels>, viewport: Size<Pixels>) -> Point<Pixels> {
+    let keep = px(KEEP_SHOWN);
+    point(at.x.min(viewport.width - keep).max(keep - size.width), at.y.min(viewport.height - keep).max(px(0.0)))
+}
+
 pub fn place_of(key: &str) -> Option<Point<Pixels>> {
     let p = read().get("places")?.get(key)?.as_array()?.clone();
     Some(point(px(p.first()?.as_f64()? as f32), px(p.get(1)?.as_f64()? as f32)))
@@ -94,9 +100,7 @@ impl AppWindow {
             (_, Some(p)) => p,
             _ => point((viewport.width - size.width) / 2.0, (viewport.height - size.height) / 2.0),
         };
-        let keep = px(KEEP_SHOWN);
-        let x = at.x.min(viewport.width - keep).max(keep - size.width);
-        let y = at.y.min(viewport.height - keep).max(px(0.0));
+        let Point { x, y } = keep_shown(at, size, viewport);
         let measure = {
             let (bounds, slot, known) = (self.bounds.clone(), o.slot.clone(), measured.is_some());
             canvas(
@@ -127,6 +131,13 @@ impl AppWindow {
         div().absolute().left(x).top(y).when(measured.is_none(), |d| d.opacity(0.0)).child(body).into_any_element()
     }
 
+    /// The window border included: its bounds are measured inside the border,
+    /// but `size` and `place` include it.
+    pub(super) fn outer_bounds(&self, o: &Overlay) -> Option<Bounds<Pixels>> {
+        let b = self.bounds.borrow().get(&o.slot).copied()?;
+        Some(if o.bare { b } else { b.dilate(px(1.0)) })
+    }
+
     fn raise_window(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(i) = self.overlays.iter().position(|o| o.id == id) else { return };
         if i + 1 < self.overlays.len() {
@@ -145,17 +156,24 @@ impl AppWindow {
         if on_terminal {
             return;
         }
-        let Some(b) = self.bounds.borrow().get(&format!("overlay:{id}")).copied() else { return };
+        // Outer, as `place` is: grabbed inside the border, a drop would shift it 1 px.
+        let Some(b) = self.overlays.iter().find(|o| o.id == id).and_then(|o| self.outer_bounds(o)) else { return };
         self.win_drag = Some(WinDrag { id: id.to_owned(), grab: at - b.origin, down: at, pointer: at, moving: false });
         cx.notify();
     }
 
-    fn window_move(&mut self, at: Point<Pixels>, pressed: bool, cx: &mut Context<Self>) {
+    fn window_move(&mut self, at: Point<Pixels>, button: Option<MouseButton>, viewport: Size<Pixels>, cx: &mut Context<Self>) {
         let Some(d) = &mut self.win_drag else { return };
-        if !pressed {
-            self.win_drag = None;
-            cx.notify();
-            return;
+        match button {
+            Some(MouseButton::Left) => {}
+            // Another button reported while left is held (macOS sends a right
+            // drag then): the left press is still on.
+            Some(_) => return,
+            // Released outside the app: no mouse up came, so this one ends the drag.
+            None => {
+                self.win_up_swallow = self.window_release(viewport, cx);
+                return;
+            }
         }
         d.pointer = at;
         let dist = f32::from((at.x - d.down.x).abs()).max(f32::from((at.y - d.down.y).abs()));
@@ -167,13 +185,16 @@ impl AppWindow {
 
     /// Ends a press: a drag leaves the window there (and remembers it under its
     /// key); returns true so the release doesn't also click what's under it.
-    fn window_release(&mut self, cx: &mut Context<Self>) -> bool {
+    fn window_release(&mut self, viewport: Size<Pixels>, cx: &mut Context<Self>) -> bool {
         let Some(d) = self.win_drag.take() else { return false };
         cx.notify();
         if !d.moving {
             return false;
         }
         let at = d.pointer - d.grab;
+        let measured = self.overlays.iter().find(|o| o.id == d.id).and_then(|o| self.bounds.borrow().get(&o.slot).map(|b| b.size));
+        // A release outside the app reports a pointer far off screen; saving that would lose the window.
+        let at = keep_shown(at, measured.unwrap_or_default(), viewport);
         if let Some(o) = self.overlays.iter_mut().find(|o| o.id == d.id) {
             o.place = Some(at);
             if let Some(k) = &o.key {
@@ -185,21 +206,45 @@ impl AppWindow {
 
     /// While a window is pressed: follows the pointer anywhere in the app.
     pub(super) fn window_tracker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        self.win_drag.as_ref()?;
+        if self.win_drag.is_none() && !self.win_up_swallow {
+            return None;
+        }
         let this = cx.entity().downgrade();
         Some(
             canvas(
                 |_, _, _| {},
                 move |_, _, window, _| {
                     let t = this.clone();
-                    window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
+                    window.on_mouse_event(move |ev: &MouseMoveEvent, phase, window, cx| {
                         if phase == DispatchPhase::Capture {
-                            let _ = t.update(cx, |this, cx| this.window_move(ev.position, ev.pressed_button == Some(MouseButton::Left), cx));
+                            let viewport = window.viewport_size();
+                            let _ = t.update(cx, |this, cx| this.window_move(ev.position, ev.pressed_button, viewport, cx));
                         }
                     });
                     let t = this.clone();
-                    window.on_mouse_event(move |ev: &MouseUpEvent, phase, _, cx| {
-                        if phase == DispatchPhase::Capture && ev.button == MouseButton::Left && t.update(cx, |this, cx| this.window_release(cx)).unwrap_or(false) {
+                    // A new press: its mouse up is a click of its own.
+                    window.on_mouse_event(move |_: &MouseDownEvent, phase, _, cx| {
+                        if phase == DispatchPhase::Capture {
+                            let _ = t.update(cx, |this, _| this.win_up_swallow = false);
+                        }
+                    });
+                    let t = this.clone();
+                    window.on_mouse_event(move |ev: &MouseUpEvent, phase, window, cx| {
+                        let viewport = window.viewport_size();
+                        if phase != DispatchPhase::Capture || ev.button != MouseButton::Left {
+                            return;
+                        }
+                        let ended = t
+                            .update(cx, |this, cx| {
+                                let swallowed = std::mem::take(&mut this.win_up_swallow);
+                                if swallowed {
+                                    cx.notify();
+                                }
+                                let released = this.window_release(viewport, cx);
+                                swallowed || released
+                            })
+                            .unwrap_or(false);
+                        if ended {
                             cx.stop_propagation();
                         }
                     });
@@ -209,5 +254,36 @@ impl AppWindow {
             .size_full()
             .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `super::*`: it brings gpui's `test` attribute, which expands to `#[test]` again and recurses.
+    use super::keep_shown;
+    use gpui::{point, px};
+
+    fn clamped(at: (f32, f32), size: (f32, f32)) -> (f32, f32) {
+        let p = keep_shown(point(px(at.0), px(at.1)), gpui::size(px(size.0), px(size.1)), gpui::size(px(1000.0), px(600.0)));
+        (f32::from(p.x), f32::from(p.y))
+    }
+
+    #[test]
+    fn a_drop_far_past_any_side_keeps_a_strip_of_the_window_shown() {
+        // Left: the window's right 48 px stay on screen. Top: the title bar must not leave.
+        assert_eq!(clamped((-9999.0, -9999.0), (300.0, 200.0)), (-252.0, 0.0));
+        assert_eq!(clamped((9999.0, 9999.0), (300.0, 200.0)), (952.0, 552.0));
+        assert_eq!(clamped((9999.0, -9999.0), (300.0, 200.0)), (952.0, 0.0));
+        assert_eq!(clamped((-9999.0, 9999.0), (300.0, 200.0)), (-252.0, 552.0));
+    }
+
+    #[test]
+    fn a_spot_already_shown_is_left_alone() {
+        assert_eq!(clamped((100.0, 100.0), (300.0, 200.0)), (100.0, 100.0));
+    }
+
+    #[test]
+    fn an_unmeasured_zero_size_window_is_still_pulled_inside() {
+        assert_eq!(clamped((-500.0, -500.0), (0.0, 0.0)), (48.0, 0.0));
     }
 }

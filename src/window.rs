@@ -402,6 +402,9 @@ pub struct AppWindow {
     pane_grip_rows: RefCell<HashMap<String, f32>>,
     /// A window (`kind: "window"` overlay) being pressed or dragged.
     win_drag: Option<movable::WinDrag>,
+    /// A window drag ended by a buttonless move: a mouse up that still comes
+    /// belongs to that drag and must not click what's under it.
+    win_up_swallow: bool,
     float_anims: HashMap<String, floats::FloatAnim>,
     float_reveal: HashMap<String, floats::Reveal>,
     float_hover: HashSet<String>,
@@ -538,6 +541,7 @@ impl AppWindow {
             pane_grip_hover: None,
             pane_grip_rows: RefCell::default(),
             win_drag: None,
+            win_up_swallow: false,
             float_anims: HashMap::new(),
             float_reveal: HashMap::new(),
             float_hover: HashSet::new(),
@@ -7741,6 +7745,7 @@ export default class Probe extends View {
     }
 
     include!("window/drag_tests.rs");
+    include!("window/movable_tests.rs");
 
     /// The whole path, in a real window: a layout names the toast mod, a
     /// notification opens it with its props, and it can close itself (as one
