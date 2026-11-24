@@ -362,6 +362,12 @@ struct Overlay {
     key: Option<String>,
     /// A `resizable` window: the smallest it may be dragged to, as designed.
     resizable: Option<Size<f32>>,
+    /// A window's `anchor`: the `overlay_anchor` it grows out of and returns to.
+    anchor: Option<String>,
+    motion: Option<movable::Motion>,
+    /// Shrinking or fading away: removes it when the motion ends. It counts
+    /// as closed already (status, reopening its key or id).
+    closing: Option<Task<()>>,
     /// The app's own screen (a `frame-` mod: What's new, the welcome): only
     /// its own close ends it, never a layout switch.
     frame: bool,
@@ -3694,7 +3700,7 @@ impl AppWindow {
                 spec["mod"] = json!(name);
                 // One popup per mod: running mod.open again toggles it, like app.settings.
                 let id = format!("mod-{name}");
-                if self.overlays.iter().any(|o| o.id == id) {
+                if self.overlays.iter().any(|o| o.id == id && o.closing.is_none()) {
                     self.close_overlay(&id, window, cx);
                 } else {
                     self.open_overlay(id, spec, window, cx);
@@ -4001,6 +4007,10 @@ impl AppWindow {
             _ => OverlayKind::Dialog,
         };
         let key = spec.get("key").and_then(Value::as_str).filter(|k| !k.is_empty() && kind == OverlayKind::Window).map(str::to_owned);
+        // Still on its way out under this id: two would answer to it.
+        if self.overlays.iter().any(|o| o.id == id && o.closing.is_some()) {
+            self.remove_overlay(&id, window, cx);
+        }
         // One window per name: opening it again replaces it, in its place.
         let mut place = key.as_deref().and_then(movable::place_of);
         if let Some(k) = &key
@@ -4076,6 +4086,9 @@ impl AppWindow {
         }
         let first_term = layout.as_ref().and_then(|l| l.visible_blocks().into_iter().find(|n| matches!(n.content(), Some(Content::Terminal { .. }))).map(|n| n.id.clone()));
         let has_layout = layout.is_some();
+        let anchor = spec.get("anchor").and_then(Value::as_str).filter(|a| !a.is_empty() && kind == OverlayKind::Window).map(str::to_owned);
+        // An anchor not drawn now (its panel closed, a kept window at start): it just appears.
+        let motion = anchor.as_deref().and_then(|a| gpui_shell::overlay_anchor(window.window_handle().window_id(), a)).map(|b| movable::Motion::open(b, cx.reduce_motion()));
         self.overlays.push(Overlay {
             id,
             kind,
@@ -4092,6 +4105,9 @@ impl AppWindow {
             place,
             key: key.clone(),
             resizable,
+            anchor,
+            motion,
+            closing: None,
             frame: spec.get("mod").and_then(Value::as_str).is_some_and(|m| m.starts_with("frame-")),
         });
         if let Some(k) = &key {
@@ -4149,7 +4165,9 @@ impl AppWindow {
         if let Some(k) = self.overlays.iter().find(|o| o.id == id).and_then(|o| o.key.clone()) {
             movable::forget(&self.layout_name, &k);
         }
-        self.remove_overlay(id, window, cx);
+        if !self.close_into_anchor(id, window, cx) {
+            self.remove_overlay(id, window, cx);
+        }
     }
 
     fn remove_overlay(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -4253,7 +4271,7 @@ impl AppWindow {
                 "layout": self.layout_name,
                 "agent": self.shown_agent(),
                 "floats": self.float_status(),
-                "overlays": self.overlays.iter().map(|o| match &o.layout {
+                "overlays": self.overlays.iter().filter(|o| o.closing.is_none()).map(|o| match &o.layout {
                     Some(_) => Some("layout".to_owned()),
                     None => self.copies.get(&o.slot).map(|c| c.inst.name.clone()),
                 }).collect::<Vec<_>>(),
@@ -5685,6 +5703,7 @@ impl Render for AppWindow {
         }
         self.publish_focused_selection(window, cx);
         self.tick_floats(window);
+        self.tick_windows(window, cx);
         self.apply_titlebar(window);
         self.apply_blur(window);
         if mods::publish_window(self.window_json(window)) {
