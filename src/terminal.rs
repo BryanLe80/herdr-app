@@ -145,6 +145,8 @@ struct Grid {
     painted: Vec<(Rc<Vec<vt::Cell>>, Vec<RowOp>, Option<usize>)>,
     /// Font size, cell size, cell font, bold weight, loaded fonts and ligature setting used to draw.
     painted_with: (u32, Size<Pixels>, Font, u16, u64, bool),
+    /// Rows drawn from the top, the spare height all below (`grid_origin`).
+    hold_top: bool,
 }
 
 pub struct TerminalView {
@@ -343,6 +345,7 @@ impl TerminalView {
                 track: None,
                 painted: Vec::new(),
                 painted_with: (0, Size::default(), font(""), 0, 0, false),
+                hold_top: false,
             })),
             focus: cx.focus_handle(),
             was_focused: false,
@@ -676,6 +679,18 @@ impl TerminalView {
     /// Sizes a terminal that isn't on screen as its pane would be (`AppWindow::fit_hidden_tabs`).
     pub fn fit(&self, cols: u16, rows: u16, cell: Size<Pixels>, scale: f32) {
         self.grid.borrow_mut().fit(cols, rows, cell, scale);
+    }
+
+    /// While the window around this terminal is resized from its edge: rows
+    /// stay at the top. Returns whether that changed.
+    pub fn hold_rows_at_top(&self, hold: bool) -> bool {
+        let mut g = self.grid.borrow_mut();
+        std::mem::replace(&mut g.hold_top, hold) != hold
+    }
+
+    #[cfg(test)]
+    pub fn holds_rows_at_top(&self) -> bool {
+        self.grid.borrow().hold_top
     }
 
     pub fn on_screen_this_frame(&self) -> bool {
@@ -2121,18 +2136,27 @@ fn find_input_style() -> InputEditorStyle {
     }
 }
 
+/// The cell grid's top left in `bounds`, on a device pixel. Rows rarely fill
+/// the height exactly, so the rest splits above and below. With `hold_top` it
+/// all goes below: while the height changes under the rows (a window resized
+/// from its edge), centring would slide the text 1 px per 2 px of drag and
+/// jump it back half a line at each new row.
+fn grid_origin(bounds: Bounds<Pixels>, rows: u16, cell_height: Pixels, (pad_x, pad_y): (f32, f32), scale: f32, hold_top: bool) -> Point<Pixels> {
+    let spare = (f32::from(bounds.size.height) - 2.0 * pad_y - f32::from(cell_height) * f32::from(rows)).max(0.0);
+    let above = if hold_top { 0.0 } else { (spare / 2.0).floor() };
+    let snap = |v: Pixels| px((f32::from(v) * scale).round() / scale);
+    let origin = bounds.origin + point(px(pad_x), px(pad_y + above));
+    point(snap(origin.x), snap(origin.y))
+}
+
 fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, window: &mut Window, cx: &mut App) {
     crate::bench::count(&crate::bench::GRID);
     let mut g = grid.borrow_mut();
     let cell = g.cell;
     let metrics = cell_metrics(window);
-    let (pad_x, pad_y) = pad();
-    // Rows rarely fill the height exactly: split what's left above and below.
-    let spare = (f32::from(bounds.size.height) - 2.0 * pad_y - f32::from(cell.height) * g.vt.rows as f32).max(0.0);
     let scale = window.scale_factor();
     let snap = |v: Pixels| px((f32::from(v) * scale).round() / scale);
-    let origin = bounds.origin + point(px(pad_x), px(pad_y + (spare / 2.0).floor()));
-    let origin = point(snap(origin.x), snap(origin.y));
+    let origin = grid_origin(bounds, g.vt.rows, cell.height, pad(), scale, g.hold_top);
     g.origin = origin;
     let frame = g.vt.frame();
     let placements = g.vt.placements();
@@ -2811,6 +2835,28 @@ impl Focusable for TerminalView {
 mod tests {
     use super::{ScrollTarget, pages_to_lines, scroll_target, scroll_state_changed};
     use serde_json::{Value, json};
+
+    #[test]
+    fn rows_centre_in_their_pane_unless_held_at_the_top() {
+        use gpui::{Bounds, point, px, size};
+        let at = |height: f32, rows: u16, hold: bool| {
+            let o = super::grid_origin(Bounds::new(point(px(10.0), px(20.0)), size(px(400.0), px(height))), rows, px(17.0), (6.0, 4.0), 2.0, hold);
+            (f32::from(o.x), f32::from(o.y))
+        };
+        // 10 rows of 17 px in 190 px with 4 px pads: 12 px spare, 6 above.
+        assert_eq!(at(190.0, 10, false), (16.0, 30.0));
+        assert_eq!(at(195.0, 10, false), (16.0, 32.0));
+        // Taller than its rows' worth: the extra row goes in, the text moves back up.
+        assert_eq!(at(195.0, 11, false), (16.0, 24.0));
+        // Rows taller than the pane: no spare, not negative.
+        assert_eq!(at(100.0, 10, false), (16.0, 24.0));
+        // Held: the same spot at every height and row count.
+        for (height, rows) in [(190.0, 10), (195.0, 10), (195.0, 11), (100.0, 10), (600.0, 34)] {
+            assert_eq!(at(height, rows, true), (16.0, 24.0), "{height} px, {rows} rows");
+        }
+        // An odd spare px goes below.
+        assert_eq!(at(191.0, 10, false), (16.0, 30.0));
+    }
 
     #[test]
     fn scroll_refreshes_only_when_leaving_or_reaching_end_or_alternate_screen() {

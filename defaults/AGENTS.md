@@ -88,7 +88,7 @@ first frame or during GPU recovery it reports an error instead of a PNG.
 | `icons/` | the shipped program icons | written by Herdr (put your own elsewhere) |
 | `frame/` | the app's own screens (welcome, ...) | rewritten by Herdr on every start: don't edit, it won't stick |
 | `view.json` | this screen's selected space/tab/pane, zoom, settled tabs, recent spaces and seen attention | written by Herdr |
-| `shared.json`, `data/`, `seen.json`, `installed.json`, `window.json`, `windows.json` | mod state, bookkeeping, where the window was (size, maximized), mods' windows (spots, kept ones) | written by Herdr |
+| `shared.json`, `data/`, `seen.json`, `installed.json`, `window.json`, `windows.json` | mod state, bookkeeping, where the window was (size, maximized), mods' windows (spots, sizes, kept ones) | written by Herdr |
 
 Shared state is saved atomically in the background, with the latest change winning.
 If `shared.json` is invalid, Herdr logs a warning and keeps it as
@@ -1233,6 +1233,12 @@ All of it is in `herdr.d.ts`. In short:
   or centered. `key: "name"` remembers its spot (opening that key again
   replaces it); `keep: true` with a key reopens it on the next start. A
   layout switch closes windows; kept ones come back with their layout.
+  `resizable: true` lets people drag its sides and corners to resize it,
+  live: the mod keeps running and its root `on_size_change` reports the new
+  size. `minWidth`/`minHeight` (px, default 96 × 48, at least 32) are the
+  smallest it gets, at most the app's size; a window that opens smaller than
+  its min isn't forced up to it by a drag. With a `key` it reopens at the dragged size, over
+  `width`/`height` (a side never dragged follows them), never bigger than the app.
   A window can hold a layout, terminals too: a terminal keeps its presses
   (selecting text), so give it a mod block to drag by, a title bar:
   `openOverlay({ kind: "window", key: "t7", width: 600, height: 400, layout: { type: "column", children: [{ type: "block", size: { px: 28 }, content: { mod: "my-titlebar" } }, { type: "block", content: { terminal: "t7" } }] } })`.
