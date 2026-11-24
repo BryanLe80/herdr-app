@@ -740,7 +740,9 @@ impl AppWindow {
             let mut subscribed_generation = u64::MAX;
             let mut event_lines = crate::hc::EventLines::default();
             let mut known_machines = Value::Null;
-            let (mut tick, mut relist) = (0u64, false);
+            let (mut machines_asked, mut relist) = (None, false);
+            // What the wait between passes already took from the stream.
+            let mut waited = crate::hc::Waited::default();
             loop {
                 let Ok((core, generation)) = this.update(cx, |this, _| {
                     (this.core.clone(), this.core_generation)
@@ -761,7 +763,7 @@ impl AppWindow {
                         event_lines = crate::hc::EventLines::new(&snapshot);
                         (channel, events)
                     });
-                    (tick, relist) = (0, true);
+                    (machines_asked, relist, waited) = (None, true, crate::hc::Waited::default());
                     if this.update_in(cx, |this, window, cx| {
                         if generation != this.core_generation { return; }
                         this.documents.entry(String::new()).or_default().connection(true, None, None);
@@ -769,19 +771,25 @@ impl AppWindow {
                         this.sync(window, cx);
                     }).is_err() { break; }
                 }
-                let ask_machines = tick.is_multiple_of(5);
-                tick += 1;
+                let now = cx.background_executor().now();
+                let ask_machines = crate::hc::machines_due(machines_asked, now);
+                if ask_machines {
+                    machines_asked = Some(now);
+                }
                 let relisting = std::mem::take(&mut relist);
+                let carried = std::mem::take(&mut waited);
+                let credit_core = core.clone();
                 let (sub, machines, refresh, listed, lines, machine_names) = cx.background_executor().spawn(async move {
                     // The local stream forwards remote doc events too.
                     let mut sub = subscription;
-                    let (mut refresh, mut terminals) = (false, relisting);
+                    let (mut refresh, mut terminals) = (carried.pushed.docs || carried.closed, relisting || carried.pushed.terminals);
+                    let mut closed = carried.closed;
+                    if closed { sub = None; }
                     if sub.is_none() && let Ok((channel, events, snapshot)) = core.subscribe() {
                         event_lines = crate::hc::EventLines::new(&snapshot);
                         sub = Some((channel, events));
-                        (refresh, terminals) = (true, true);
+                        (refresh, terminals, closed) = (true, true, false);
                     }
-                    let mut closed = false;
                     if let Some((channel, events)) = &sub {
                         while let Ok(event) = events.try_recv() {
                             if let crate::hc::Stream::Data(bytes) = event {
@@ -794,7 +802,8 @@ impl AppWindow {
                     }
                     // A stream that ended is subscribed to again, with a fresh snapshot.
                     if closed { sub = None; }
-                    let machines = if ask_machines || terminals { core.call("machine.list", json!({})).ok() } else { None };
+                    // On its clock only: an early pass for a new terminal makes no RPC of its own.
+                    let machines = if ask_machines { core.call("machine.list", json!({})).ok() } else { None };
                     let machines_changed = machines.as_ref().is_some_and(|m| m != &known_machines);
                     if let Some(m) = &machines { known_machines = m.clone(); }
                     let listed = (terminals || machines_changed).then(|| event_lines.live_for(&core.hello, &known_machines));
@@ -825,7 +834,16 @@ impl AppWindow {
                     this.fit_hidden_tabs(window, cx);
                     this.flush_documents(refresh, window, cx);
                 }).is_err() { break; }
-                cx.background_executor().timer(Duration::from_millis(500)).await;
+                let executor = cx.background_executor().clone();
+                let timer = executor.timer(Duration::from_millis(500));
+                let channel = subscription.as_ref().map(|(channel, _)| *channel);
+                let credit = move |n| if let Some(channel) = channel { credit_core.credit(channel, n) };
+                (waited, event_lines, subscription) = cx.background_executor().spawn(async move {
+                    let mut lines = event_lines;
+                    let gap = || executor.timer(crate::hc::LISTING_GAP);
+                    let waited = crate::hc::wait_for_events(subscription.as_ref().map(|(_, events)| events), &mut lines, credit, timer, gap).await;
+                    (waited, lines, subscription)
+                }).await;
             }
         }));
         w._tasks.push(cx.spawn_in(window, async move |this, cx| {
